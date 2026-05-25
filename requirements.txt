@@ -1,0 +1,3 @@
+# The Python backend currently uses only the standard library.
+# Keep this file so deployers can run `python3 -m pip install -r requirements.txt`.
+

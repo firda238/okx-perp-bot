@@ -1,0 +1,29 @@
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# Runtime data and local research output
+.cache/
+output/
+test-results/
+.playwright-cli/
+
+# Frontend
+quant-studio-ui/node_modules/
+quant-studio-ui/dist/
+quant-studio-ui/test-results/
+
+# Logs and local environment
+*.log
+*.pid
+.env
+.env.*
+!.env.example
+

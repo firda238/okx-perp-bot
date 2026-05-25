@@ -1,0 +1,1039 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OKX 永续策略研究台</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">OKX Perpetual Research</p>
+        <h1>永续策略研究台</h1>
+      </div>
+      <div class="topbar-actions">
+        <div id="status" class="status">就绪</div>
+        <button id="runBacktest">运行回测</button>
+        <button id="runValidate" class="secondary">多市场验证</button>
+        <button id="runSliceValidate" class="secondary">切片验证</button>
+        <button id="runPortfolio" class="secondary">组合回测</button>
+        <button id="runPortfolioSlices" class="secondary">组合切片</button>
+        <button id="runRobustness" class="secondary">稳健测试</button>
+        <button id="runMonteCarlo" class="secondary">蒙特卡洛</button>
+        <button id="runReadiness" class="secondary">模拟准入</button>
+        <button id="runBenchmarks" class="secondary">基准对照</button>
+        <button id="runAttribution" class="secondary">模块归因</button>
+        <button id="runAttributionExperiments" class="secondary">归因实验</button>
+        <button id="saveResearchSnapshot" class="secondary">保存快照</button>
+        <button id="runJointOptimize" class="secondary">联合扫描</button>
+      </div>
+    </header>
+
+    <nav class="view-tabs" aria-label="工作区">
+      <button class="view-tab is-active" data-view-target="overview">总览</button>
+      <button class="view-tab" data-view-target="backtest">回测</button>
+      <button class="view-tab" data-view-target="risk">风控</button>
+      <button class="view-tab" data-view-target="research">研究</button>
+      <button class="view-tab" data-view-target="paper">模拟</button>
+      <button class="view-tab" data-view-target="archive">快照</button>
+    </nav>
+
+    <main class="workspace">
+      <aside class="sidebar">
+        <section class="panel">
+          <h2>市场</h2>
+          <div class="control-stack">
+            <label>
+              策略
+              <select id="strategyMode">
+                <option value="regime_multi_strategy">行情分类多策略</option>
+                <option value="trend_pullback">趋势回调延续</option>
+                <option value="trend_breakout">趋势 Donchian 突破</option>
+                <option value="louie_price_action" selected>Louie 风格价格行为</option>
+                <option value="adaptive_price_action">行情分类价格行为</option>
+                <option value="trend_price_action">趋势过滤价格行为</option>
+                <option value="raw_price_action">原始价格行为</option>
+              </select>
+            </label>
+            <label>
+              交易对
+              <select id="instId">
+                <option>BTC-USDT-SWAP</option>
+                <option>ETH-USDT-SWAP</option>
+                <option>SOL-USDT-SWAP</option>
+              </select>
+            </label>
+            <div class="two-col">
+              <label>
+                周期
+                <select id="bar">
+                  <option>5m</option>
+                  <option>15m</option>
+                  <option selected>1H</option>
+                  <option>4H</option>
+                </select>
+              </label>
+              <label>
+                趋势
+                <select id="trendBar">
+                  <option selected>1H</option>
+                  <option>4H</option>
+                </select>
+              </label>
+            </div>
+            <div class="two-col">
+              <label>
+                窗口
+                <select id="historyPreset">
+                  <option value="24">24 小时</option>
+                  <option value="72">3 天</option>
+                  <option value="168">7 天</option>
+                  <option value="720">30 天</option>
+                  <option value="2160" selected>90 天</option>
+                  <option value="custom">自定义</option>
+                </select>
+              </label>
+              <label>
+                小时
+                <input id="historyHours" type="number" value="2160" min="1" max="2160" step="1" />
+              </label>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>风控</h2>
+          <div class="control-stack">
+            <div class="two-col">
+              <label>
+                初始资金
+                <input id="initialEquity" type="number" value="10" min="1" step="1" />
+              </label>
+              <label>
+                最大亏损 %
+                <input id="riskPct" type="number" value="10" min="1" max="40" step="1" />
+              </label>
+            </div>
+            <div class="two-col">
+              <label>
+                最高杠杆
+                <input id="leverage" type="number" value="75" min="1" max="125" step="1" />
+              </label>
+              <label>
+                保证金 %
+                <input id="marginPctPerTrade" type="number" value="70" min="5" max="100" step="5" />
+              </label>
+            </div>
+            <div class="two-col">
+              <label>
+                爆仓缓冲 %
+                <input id="minLiqBufferPct" type="number" value="0.3" min="0" max="5" step="0.1" />
+              </label>
+              <label>
+                滑点 %
+                <input id="slippagePct" type="number" value="0.02" min="0" max="0.2" step="0.01" />
+              </label>
+            </div>
+            <label>
+              成本模型
+              <select id="costModel">
+                <option value="simple" selected>简单双边成本</option>
+                <option value="okx_aggressive">OKX 激进实盘</option>
+                <option value="okx_limit">OKX 限价优先</option>
+                <option value="okx_conservative">OKX 保守压力</option>
+              </select>
+            </label>
+            <div class="two-col">
+              <label>
+                Maker 费率 %
+                <input id="makerFeePct" type="number" value="0.02" min="0" max="0.2" step="0.005" />
+              </label>
+              <label>
+                Taker 费率 %
+                <input id="takerFeePct" type="number" value="0.05" min="0" max="0.2" step="0.005" />
+              </label>
+            </div>
+            <div class="two-col">
+              <label>
+                ATR 止损
+                <input id="atrStopMult" type="number" value="1.8" min="0.5" max="5" step="0.1" />
+              </label>
+              <label>
+                止盈 R
+                <input id="takeProfitRr" type="number" value="2.8" min="0.5" max="6" step="0.1" />
+              </label>
+            </div>
+            <div class="two-col">
+              <label>
+                TP1 仓位 %
+                <input id="tp1SharePct" type="number" value="40" min="5" max="90" step="5" />
+              </label>
+              <label>
+                TP2 仓位 %
+                <input id="tp2SharePct" type="number" value="30" min="0" max="90" step="5" />
+              </label>
+            </div>
+            <label>
+              冷却 K 数
+              <input id="cooldownBars" type="number" value="4" min="0" max="50" step="1" />
+            </label>
+            <div class="two-col">
+              <label>
+                时间止损 K
+                <input id="timeExitBars" type="number" value="0" min="0" max="300" step="1" />
+              </label>
+              <label>
+                时间止损 R
+                <input id="timeExitMinRr" type="number" value="0.25" min="-2" max="3" step="0.05" />
+              </label>
+            </div>
+            <label>
+              连亏暂停 K 数
+              <input id="lossStreakPauseBars" type="number" value="0" min="0" max="300" step="1" />
+            </label>
+            <label>
+              空头趋势降权
+              <input id="shortTrendRiskFactor" type="number" value="1.00" min="0.05" max="1.5" step="0.05" />
+            </label>
+            <div class="two-col">
+              <label>
+                日最多单
+                <input id="maxDailyTrades" type="number" value="1" min="1" max="10" step="1" />
+              </label>
+              <label>
+                信号评分
+                <input id="minSignalScore" type="number" value="0" min="-1" max="2" step="0.05" />
+              </label>
+            </div>
+            <label>
+              第二单过滤
+              <select id="secondTradeFilter">
+                <option value="off" selected>不过滤</option>
+                <option value="delayed">只延迟扫损</option>
+                <option value="sweep">只扫损类</option>
+              </select>
+            </label>
+            <div class="two-col">
+              <label>
+                日亏熔断 %
+                <input id="maxDailyLossPct" type="number" value="6" min="1" max="50" step="1" />
+              </label>
+              <label>
+                连亏熔断
+                <input id="maxLossStreakStop" type="number" value="3" min="1" max="20" step="1" />
+              </label>
+            </div>
+            <div class="two-col">
+              <label>
+                回撤熔断 %
+                <input id="maxAccountDrawdownPct" type="number" value="15" min="1" max="80" step="1" />
+              </label>
+              <label>
+                波动熔断 %
+                <input id="maxAtrPct" type="number" value="1.2" min="0.1" max="10" step="0.1" />
+              </label>
+            </div>
+            <div class="two-col">
+              <label>
+                回撤降仓
+                <input id="drawdownRiskSensitivity" type="number" value="2.4" min="0" max="6" step="0.1" />
+              </label>
+              <label>
+                最低风险因子
+                <input id="minAdaptiveRiskFactor" type="number" value="0.30" min="0.05" max="1" step="0.01" />
+              </label>
+            </div>
+            <label class="check-row">
+              <input id="adaptiveLeverage" type="checkbox" checked />
+              固定资金，自动调杠杆和止盈
+            </label>
+            <label class="check-row">
+              <input id="useMultiTakeProfit" type="checkbox" />
+              分批止盈
+            </label>
+            <label class="check-row">
+              <input id="breakEvenAfterTp1" type="checkbox" checked />
+              TP1 后止损推到入场价
+            </label>
+            <label class="check-row">
+              <input id="enableRiskCircuitBreaker" type="checkbox" checked />
+              启用风控熔断
+            </label>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>信号过滤</h2>
+          <div class="control-stack">
+            <div class="two-col">
+              <label>
+                回看 K
+                <input id="lookback" type="number" value="12" min="8" max="100" step="1" />
+              </label>
+              <label>
+                最低 ADX
+                <input id="minAdx" type="number" value="18" min="0" max="60" step="1" />
+              </label>
+            </div>
+            <div class="two-col">
+              <label>
+                突破 ATR
+                <input id="minBreakoutAtr" type="number" value="0.15" min="0" max="2" step="0.05" />
+              </label>
+              <label>
+                扫损 ATR
+                <input id="minSweepAtr" type="number" value="0.25" min="0" max="2" step="0.05" />
+              </label>
+            </div>
+            <label>
+              实体强度
+              <input id="minBodyRatio" type="number" value="0.45" min="0.2" max="0.9" step="0.05" />
+            </label>
+            <label>
+              突破风险系数
+              <input id="breakoutRiskFactor" type="number" value="0.70" min="0.1" max="1.2" step="0.05" />
+            </label>
+            <div class="two-col">
+              <label>
+                突破防守窗口
+                <input id="breakoutGuardWindow" type="number" value="6" min="2" max="30" step="1" />
+              </label>
+              <label>
+                突破防守系数
+                <input id="breakoutGuardRiskMultiplier" type="number" value="0.55" min="0.05" max="1" step="0.05" />
+              </label>
+            </div>
+            <label class="check-row">
+              <input id="requireNextConfirmation" type="checkbox" checked />
+              次 K 确认后入场
+            </label>
+            <label class="check-row">
+              <input id="enableBreakoutGuard" type="checkbox" />
+              启用突破防守
+            </label>
+            <label class="check-row">
+              <input id="preferCache" type="checkbox" />
+              研究回测优先用新鲜缓存
+            </label>
+            <label class="check-row">
+              <input id="blockEthLongs" type="checkbox" />
+              过滤 ETH 做多
+            </label>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>操作</h2>
+          <div class="action-grid">
+            <button id="warmupData" class="secondary">预热数据</button>
+            <button id="applyDailyMode" class="secondary">应用每日模式</button>
+            <button id="applyTargetMode" class="secondary">应用20%目标</button>
+            <button id="runValidateSide" class="secondary">多市场验证</button>
+            <button id="runSliceValidateSide" class="secondary">切片验证</button>
+            <button id="runPortfolioSide" class="secondary">组合回测</button>
+            <button id="runPortfolioSlicesSide" class="secondary">组合切片</button>
+            <button id="runRobustnessSide" class="secondary">稳健测试</button>
+            <button id="runMonteCarloSide" class="secondary">蒙特卡洛</button>
+            <button id="runReadinessSide" class="secondary">模拟准入</button>
+            <button id="runBenchmarksSide" class="secondary">基准对照</button>
+            <button id="runAttributionSide" class="secondary">模块归因</button>
+            <button id="runAttributionExperimentsSide" class="secondary">归因实验</button>
+            <button id="saveResearchSnapshotSide" class="secondary">保存快照</button>
+            <button id="runSignalScan" class="secondary">扫描信号</button>
+            <button id="refreshSignalLog" class="secondary">刷新日志</button>
+            <button id="analyzeTelegram" class="secondary">学习频道</button>
+            <button id="runOptimize" class="secondary">单市场扫描</button>
+            <button id="runJointOptimizeSide" class="secondary">联合扫描</button>
+            <button id="startPaper" class="secondary">启动模拟</button>
+            <button id="stopPaper" class="secondary">停止模拟</button>
+            <button id="runPaperReconcile" class="secondary">模拟对账</button>
+          </div>
+        </section>
+      </aside>
+
+      <section class="content">
+        <section class="metric-grid" data-view="overview backtest risk paper">
+          <article>
+            <span>最终权益</span>
+            <strong id="finalEquity">-</strong>
+          </article>
+          <article>
+            <span>收益率</span>
+            <strong id="returnPct">-</strong>
+          </article>
+          <article>
+            <span>最大回撤</span>
+            <strong id="drawdown">-</strong>
+          </article>
+          <article>
+            <span>胜率</span>
+            <strong id="winRate">-</strong>
+          </article>
+          <article>
+            <span>交易</span>
+            <strong id="tradeCount">-</strong>
+          </article>
+          <article>
+            <span>盈利因子</span>
+            <strong id="profitFactor">-</strong>
+          </article>
+        </section>
+
+        <section class="main-grid" data-view="overview backtest paper">
+          <div class="chart-stack">
+            <div class="panel chart-panel">
+              <div class="panel-title">
+                <h2>价格走势</h2>
+                <div class="mini-stats">
+                  <span>期望 <strong id="expectancy">-</strong></span>
+                  <span>连亏 <strong id="maxLossStreak">-</strong></span>
+                  <span>K 数 <strong id="candleCount">-</strong></span>
+                </div>
+              </div>
+              <canvas id="priceChart" width="1100" height="360"></canvas>
+            </div>
+
+            <section class="panel chart-panel">
+              <div class="panel-title">
+                <h2>权益曲线</h2>
+              </div>
+              <canvas id="equityChart" width="1100" height="360"></canvas>
+            </section>
+          </div>
+
+          <div class="panel side-summary">
+            <h2>模拟盘状态</h2>
+            <dl id="paperState"></dl>
+            <div class="validation-summary">
+              <div>
+                <span>验证通过</span>
+                <strong id="positiveCases">-</strong>
+              </div>
+              <div>
+                <span>平均收益</span>
+                <strong id="avgValidationReturn">-</strong>
+              </div>
+              <div>
+                <span>最差回撤</span>
+                <strong id="worstValidationDrawdown">-</strong>
+              </div>
+            </div>
+            <div class="trade-review">
+              <h2>交易复盘</h2>
+              <div id="tradeReview">
+                <p class="empty-review">运行回测后选择一笔交易。</p>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="research-grid">
+        <section class="panel" data-view="overview paper research">
+          <div class="panel-title">
+            <h2>信号扫描</h2>
+            <div class="mini-stats">
+              <span>可交易 <strong id="signalReady">-</strong></span>
+              <span>待确认 <strong id="signalWatch">-</strong></span>
+              <span>过滤 <strong id="signalBlocked">-</strong></span>
+              <span>数据 <strong id="signalDataFreshness">-</strong></span>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>交易对</th>
+                  <th>K 线</th>
+                  <th>数据</th>
+                  <th>决策</th>
+                  <th>评分</th>
+                  <th>形态</th>
+                  <th>方向</th>
+                  <th>趋势/行情</th>
+                  <th>ADX</th>
+                  <th>ATR%</th>
+                  <th>原因</th>
+                </tr>
+              </thead>
+              <tbody id="signalScanRows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel" data-view="paper research">
+          <div class="panel-title">
+            <h2>扫描日志</h2>
+            <div class="mini-stats">
+              <span>记录 <strong id="logEntries">-</strong></span>
+              <span>可交易 <strong id="logReady">-</strong></span>
+              <span>过滤 <strong id="logBlocked">-</strong></span>
+            </div>
+          </div>
+          <div class="table-wrap compact-table">
+            <table>
+              <thead>
+                <tr>
+                  <th>日期</th>
+                  <th>扫描</th>
+                  <th>市场</th>
+                  <th>可交易</th>
+                  <th>待确认</th>
+                  <th>过滤</th>
+                  <th>错误</th>
+                  <th>触发市场</th>
+                </tr>
+              </thead>
+              <tbody id="signalLogRows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel" data-view="paper">
+          <div class="panel-title">
+            <h2>模拟事件</h2>
+            <div class="mini-stats">
+              <span>状态文件 <strong id="paperStateFile">-</strong></span>
+              <span>事件文件 <strong id="paperEventFile">-</strong></span>
+            </div>
+          </div>
+          <div class="table-wrap compact-table">
+            <table>
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>事件</th>
+                  <th>市场</th>
+                  <th>方向</th>
+                  <th>形态</th>
+                  <th>权益/盈亏</th>
+                  <th>说明</th>
+                </tr>
+              </thead>
+              <tbody id="paperEventRows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel" data-view="paper">
+          <div class="panel-title">
+            <h2>模拟审计与对账</h2>
+            <div class="mini-stats">
+              <span>审计文件 <strong id="paperAuditFile">-</strong></span>
+              <span>一致性 <strong id="paperReconcileSummary">-</strong></span>
+            </div>
+          </div>
+          <div class="table-wrap compact-table">
+            <table>
+              <thead>
+                <tr>
+                  <th>记录时间</th>
+                  <th>K 线</th>
+                  <th>市场</th>
+                  <th>数据</th>
+                  <th>动作</th>
+                  <th>决策</th>
+                  <th>对账</th>
+                  <th>说明</th>
+                </tr>
+              </thead>
+              <tbody id="paperAuditRows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel" data-view="research">
+          <div class="panel-title">
+            <h2>频道策略学习</h2>
+            <div class="mini-stats">
+              <span>信号 <strong id="tgSignals">-</strong></span>
+              <span>多/空 <strong id="tgSides">-</strong></span>
+              <span>TP1 R <strong id="tgAvgR">-</strong></span>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>币种</th>
+                  <th>方向</th>
+                  <th>入场</th>
+                  <th>止损</th>
+                  <th>TP</th>
+                  <th>止损%</th>
+                  <th>TP1 R</th>
+                  <th>风格</th>
+                  <th>摘要</th>
+                </tr>
+              </thead>
+              <tbody id="telegramRows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel" data-view="backtest">
+          <div class="panel-title">
+            <h2>多市场验证</h2>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>交易对</th>
+                  <th>窗口</th>
+                  <th>收益率</th>
+                  <th>回撤</th>
+                  <th>交易</th>
+                  <th>胜率</th>
+                  <th>盈利因子</th>
+                  <th>最大连亏</th>
+                  <th>状态</th>
+                </tr>
+              </thead>
+              <tbody id="validationRows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel" data-view="backtest">
+          <div class="panel-title">
+            <h2>时间切片验证</h2>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>切片</th>
+                  <th>交易对</th>
+                  <th>区间</th>
+                  <th>收益率</th>
+                  <th>回撤</th>
+                  <th>交易</th>
+                  <th>胜率</th>
+                  <th>盈利因子</th>
+                  <th>状态</th>
+                </tr>
+              </thead>
+              <tbody id="sliceValidationRows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel" data-view="overview backtest">
+          <div class="panel-title">
+            <h2>组合账户回测</h2>
+            <div class="mini-stats">
+              <span>权益 <strong id="portfolioEquity">-</strong></span>
+              <span>收益 <strong id="portfolioReturn">-</strong></span>
+              <span>回撤 <strong id="portfolioDrawdown">-</strong></span>
+              <span>交易 <strong id="portfolioTrades">-</strong></span>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>交易对</th>
+                  <th>交易</th>
+                  <th>收益贡献</th>
+                  <th>胜率</th>
+                </tr>
+              </thead>
+              <tbody id="portfolioRows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel" data-view="backtest">
+          <div class="panel-title">
+            <h2>组合切片验证</h2>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>切片</th>
+                  <th>区间</th>
+                  <th>权益</th>
+                  <th>收益率</th>
+                  <th>回撤</th>
+                  <th>交易</th>
+                  <th>胜率</th>
+                  <th>状态</th>
+                </tr>
+              </thead>
+              <tbody id="portfolioSliceRows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel wide-panel" data-view="risk backtest">
+          <div class="panel-title">
+            <h2>稳健性测试</h2>
+            <div class="mini-stats">
+              <span>结论 <strong id="robustVerdict">-</strong></span>
+              <span>滚动通过 <strong id="robustRollingPass">-</strong></span>
+              <span>压力最差 <strong id="robustStressWorst">-</strong></span>
+            </div>
+          </div>
+          <div class="robust-grid">
+            <div>
+              <h3>滚动 30 天窗口</h3>
+              <div class="table-wrap compact-table">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>窗口</th>
+                      <th>区间</th>
+                      <th>收益率</th>
+                      <th>月化</th>
+                      <th>回撤</th>
+                      <th>交易</th>
+                      <th>PF</th>
+                      <th>状态</th>
+                    </tr>
+                  </thead>
+                  <tbody id="rollingRobustRows"></tbody>
+                </table>
+              </div>
+            </div>
+            <div>
+              <h3>成本压力测试</h3>
+              <div class="table-wrap compact-table">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>场景</th>
+                      <th>模型</th>
+                      <th>费率</th>
+                      <th>滑点</th>
+                      <th>收益率</th>
+                      <th>月化</th>
+                      <th>回撤</th>
+                      <th>交易</th>
+                      <th>PF</th>
+                    </tr>
+                  </thead>
+                  <tbody id="stressRows"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel wide-panel" data-view="risk backtest">
+          <div class="panel-title">
+            <h2>蒙特卡洛压力</h2>
+            <div class="mini-stats">
+              <span>结论 <strong id="mcVerdict">-</strong></span>
+              <span>亏损概率 <strong id="mcLossProb">-</strong></span>
+              <span>跌破底线 <strong id="mcFloorProb">-</strong></span>
+              <span>P95 回撤 <strong id="mcP95Drawdown">-</strong></span>
+            </div>
+          </div>
+          <div class="attribution-summary">
+            <div><span>P5 权益</span><strong id="mcP05Equity">-</strong></div>
+            <div><span>中位权益</span><strong id="mcMedianEquity">-</strong></div>
+            <div><span>P95 权益</span><strong id="mcP95Equity">-</strong></div>
+            <div><span>最差权益</span><strong id="mcWorstEquity">-</strong></div>
+          </div>
+          <div class="table-wrap compact-table">
+            <table>
+              <thead>
+                <tr>
+                  <th>样本</th>
+                  <th>最终权益</th>
+                  <th>最大回撤</th>
+                  <th>跌破底线</th>
+                </tr>
+              </thead>
+              <tbody id="monteCarloRows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel wide-panel readiness-panel" data-view="overview risk paper">
+          <div class="panel-title">
+            <h2>模拟准入决策</h2>
+            <div class="mini-stats">
+              <span>结论 <strong id="readinessDecision">-</strong></span>
+              <span>评分 <strong id="readinessScore">-</strong></span>
+              <span>风险 <strong id="readinessRisk">-</strong></span>
+              <span>信号 <strong id="readinessSignal">-</strong></span>
+            </div>
+          </div>
+          <div class="readiness-head">
+            <div>
+              <span>月复合收益</span>
+              <strong id="readinessMonthly">-</strong>
+            </div>
+            <div>
+              <span>滚动通过率</span>
+              <strong id="readinessRolling">-</strong>
+            </div>
+            <div>
+              <span>MC 亏损概率</span>
+              <strong id="readinessLossProb">-</strong>
+            </div>
+            <div>
+              <span>下一步</span>
+              <strong id="readinessAction">-</strong>
+            </div>
+          </div>
+          <div class="table-wrap compact-table">
+            <table>
+              <thead>
+                <tr>
+                  <th>检查项</th>
+                  <th>当前值</th>
+                  <th>门槛</th>
+                  <th>权重</th>
+                  <th>状态</th>
+                  <th>动作</th>
+                </tr>
+              </thead>
+              <tbody id="readinessRows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel wide-panel" data-view="overview research">
+          <div class="panel-title">
+            <h2>外部基准对照</h2>
+            <div class="mini-stats">
+              <span>结论 <strong id="benchmarkVerdict">-</strong></span>
+              <span>市场涨跌 <strong id="benchmarkMarket">-</strong></span>
+              <span>最佳模型 <strong id="benchmarkBest">-</strong></span>
+              <span>当前排名 <strong id="benchmarkRank">-</strong></span>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>对照组</th>
+                  <th>来源</th>
+                  <th>权益</th>
+                  <th>收益率</th>
+                  <th>月复合</th>
+                  <th>超额市场</th>
+                  <th>回撤</th>
+                  <th>交易</th>
+                  <th>PF</th>
+                  <th>状态</th>
+                  <th>说明</th>
+                </tr>
+              </thead>
+              <tbody id="benchmarkRows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel" data-view="research">
+          <div class="panel-title">
+            <h2>扫描候选</h2>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>排名</th>
+                  <th>模式</th>
+                  <th>确认</th>
+                  <th>回看</th>
+                  <th>ATR</th>
+                  <th>R</th>
+                  <th>ADX</th>
+                  <th>突破</th>
+                  <th>扫损</th>
+                  <th>收益率</th>
+                  <th>回撤</th>
+                  <th>交易</th>
+                  <th>胜率</th>
+                </tr>
+              </thead>
+              <tbody id="optimizeRows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel" data-view="research">
+          <div class="panel-title">
+            <h2>策略模块归因</h2>
+            <div class="mini-stats">
+              <span>成本 <strong id="attributionCost">-</strong></span>
+              <span>成本占盈亏 <strong id="attributionCostRatio">-</strong></span>
+              <span>建议 <strong id="attributionRecommendations">-</strong></span>
+            </div>
+          </div>
+          <div id="attributionSummary" class="attribution-summary">
+            <div><span>交易</span><strong>-</strong></div>
+            <div><span>胜率</span><strong>-</strong></div>
+            <div><span>平均R</span><strong>-</strong></div>
+            <div><span>总盈亏</span><strong>-</strong></div>
+          </div>
+          <div class="table-wrap compact-table attribution-recs">
+            <table>
+              <thead>
+                <tr>
+                  <th>维度</th>
+                  <th>分类</th>
+                  <th>状态</th>
+                  <th>交易</th>
+                  <th>胜率</th>
+                  <th>PF</th>
+                  <th>盈亏</th>
+                  <th>动作</th>
+                </tr>
+              </thead>
+              <tbody id="attributionRecommendationRows"></tbody>
+            </table>
+          </div>
+          <div class="attribution-grid">
+            <div>
+              <h3>按形态</h3>
+              <div class="table-wrap compact-table">
+                <table>
+                  <thead>
+                    <tr><th>分类</th><th>交易</th><th>胜率</th><th>平均R</th><th>盈亏</th></tr>
+                  </thead>
+                  <tbody id="kindAttributionRows"></tbody>
+                </table>
+              </div>
+            </div>
+            <div>
+              <h3>按趋势</h3>
+              <div class="table-wrap compact-table">
+                <table>
+                  <thead>
+                    <tr><th>分类</th><th>交易</th><th>胜率</th><th>平均R</th><th>盈亏</th></tr>
+                  </thead>
+                  <tbody id="trendAttributionRows"></tbody>
+                </table>
+              </div>
+            </div>
+            <div>
+              <h3>按行情</h3>
+              <div class="table-wrap compact-table">
+                <table>
+                  <thead>
+                    <tr><th>分类</th><th>交易</th><th>胜率</th><th>平均R</th><th>盈亏</th></tr>
+                  </thead>
+                  <tbody id="regimeAttributionRows"></tbody>
+                </table>
+              </div>
+            </div>
+            <div>
+              <h3>按方向</h3>
+              <div class="table-wrap compact-table">
+                <table>
+                  <thead>
+                    <tr><th>分类</th><th>交易</th><th>胜率</th><th>平均R</th><th>盈亏</th></tr>
+                  </thead>
+                  <tbody id="sideAttributionRows"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel wide-panel" data-view="research risk">
+          <div class="panel-title">
+            <h2>归因驱动实验</h2>
+            <div class="mini-stats">
+              <span>最佳 <strong id="experimentBest">-</strong></span>
+              <span>收益 <strong id="experimentBestReturn">-</strong></span>
+              <span>回撤 <strong id="experimentBestDrawdown">-</strong></span>
+              <span>方案数 <strong id="experimentCases">-</strong></span>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>方案</th>
+                  <th>空头趋势</th>
+                  <th>突破风险</th>
+                  <th>评分</th>
+                  <th>权益</th>
+                  <th>收益率</th>
+                  <th>月复合</th>
+                  <th>回撤</th>
+                  <th>滚动</th>
+                  <th>最差窗口</th>
+                  <th>交易</th>
+                  <th>PF</th>
+                  <th>状态</th>
+                  <th>说明</th>
+                </tr>
+              </thead>
+              <tbody id="attributionExperimentRows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel wide-panel" data-view="archive overview">
+          <div class="panel-title">
+            <h2>研究快照</h2>
+            <div class="mini-stats">
+              <span>保存状态 <strong id="snapshotStatus">-</strong></span>
+              <span>文件 <strong id="snapshotFile">-</strong></span>
+              <span>准入 <strong id="snapshotReadiness">-</strong></span>
+              <span>最佳实验 <strong id="snapshotExperiment">-</strong></span>
+            </div>
+          </div>
+          <div class="attribution-summary">
+            <div><span>权益</span><strong id="snapshotEquity">-</strong></div>
+            <div><span>收益</span><strong id="snapshotReturn">-</strong></div>
+            <div><span>回撤</span><strong id="snapshotDrawdown">-</strong></div>
+            <div><span>PF</span><strong id="snapshotProfitFactor">-</strong></div>
+          </div>
+          <div class="table-wrap compact-table">
+            <table>
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>标签</th>
+                  <th>收益率</th>
+                  <th>回撤</th>
+                  <th>PF</th>
+                  <th>准入</th>
+                  <th>评分</th>
+                  <th>最佳实验</th>
+                  <th>文件</th>
+                </tr>
+              </thead>
+              <tbody id="snapshotRows"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel" data-view="backtest research">
+          <div class="panel-title">
+            <h2>最近交易</h2>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>入场时间</th>
+                  <th>方向</th>
+                  <th>类型</th>
+                  <th>趋势</th>
+                  <th>入场</th>
+                  <th>出场</th>
+                  <th>原因</th>
+                  <th>盈亏</th>
+                </tr>
+              </thead>
+              <tbody id="trades"></tbody>
+            </table>
+          </div>
+        </section>
+        </section>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
