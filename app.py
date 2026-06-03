@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import base64
 import http.client
+import hashlib
+import hmac
 import math
+import os
 import random
 import re
 import socket
@@ -10,8 +14,10 @@ import threading
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -49,11 +55,19 @@ SIGNAL_LOG_FILE = CACHE_DIR / "signal-scans.jsonl"
 PAPER_STATE_FILE = CACHE_DIR / "paper-state.json"
 PAPER_EVENT_FILE = CACHE_DIR / "paper-events.jsonl"
 PAPER_AUDIT_FILE = CACHE_DIR / "paper-audit.jsonl"
+EXECUTION_ORDER_FILE = CACHE_DIR / "execution-orders.jsonl"
+TASK_HISTORY_FILE = CACHE_DIR / "task-history.json"
+LIVE_TRADING_ENABLED = os.environ.get("LIVE_TRADING_ENABLED", "").lower() in {"1", "true", "yes", "on"}
+SERVER_STARTED_AT = datetime.now(timezone.utc).isoformat()
+OKX_ENV_KEYS = ("OKX_API_KEY", "OKX_API_SECRET", "OKX_API_PASSPHRASE")
+OKX_API_BASE_URL = os.environ.get("OKX_API_BASE_URL", "https://www.okx.com").rstrip("/")
+OKX_BROWSER_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
 MARKET_DATA = MarketDataStore(CACHE_DIR)
 PORTFOLIO_RESULT_CACHE = ResultCache(ttl_seconds=60, max_items=64)
 SIGNAL_LOG_LOCK = threading.Lock()
 PAPER_EVENT_LOCK = threading.Lock()
 PAPER_AUDIT_LOCK = threading.Lock()
+EXECUTION_ORDER_LOCK = threading.Lock()
 DATA_REFRESH_LOCK = threading.Lock()
 DATA_REFRESH_PROGRESS: dict[str, Any] = {
     "active": False,
@@ -93,10 +107,65 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def save_task_history_unlocked(limit: int = 80) -> None:
+    rows = sorted(TASKS.values(), key=lambda item: str(item.get("created_at") or ""), reverse=True)[:limit]
+    payload = {"updated_at": now_iso(), "tasks": rows}
+    tmp_path = TASK_HISTORY_FILE.with_suffix(".json.tmp")
+    try:
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(TASK_HISTORY_FILE)
+    except Exception as exc:
+        print(f"task history save failed: {exc}")
+
+
+def load_task_history() -> None:
+    if not TASK_HISTORY_FILE.exists():
+        return
+    try:
+        payload = json.loads(TASK_HISTORY_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"task history load failed: {exc}")
+        return
+    rows = payload.get("tasks") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        return
+    changed = False
+    now = now_iso()
+    with TASK_LOCK:
+        for row in rows:
+            if not isinstance(row, dict) or not row.get("id"):
+                continue
+            task = {
+                "id": str(row.get("id")),
+                "type": str(row.get("type") or ""),
+                "params": row.get("params") if isinstance(row.get("params"), dict) else {},
+                "status": str(row.get("status") or "failed"),
+                "progress": row.get("progress") if isinstance(row.get("progress"), dict) else {"completed": 0, "total": 0},
+                "result": row.get("result"),
+                "error": row.get("error"),
+                "cancel_requested": bool(row.get("cancel_requested")),
+                "created_at": row.get("created_at") or now,
+                "started_at": row.get("started_at"),
+                "finished_at": row.get("finished_at"),
+                "updated_at": row.get("updated_at") or now,
+            }
+            if task["status"] in {"queued", "running"}:
+                task["status"] = "cancelled"
+                task["cancel_requested"] = True
+                task["error"] = task.get("error") or "后端重启，未完成任务已中断。"
+                task["finished_at"] = task.get("finished_at") or now
+                task["updated_at"] = now
+                changed = True
+            TASKS[task["id"]] = task
+        if changed:
+            save_task_history_unlocked()
+
+
 def start_task_worker() -> None:
     global TASK_WORKER_STARTED
     if TASK_WORKER_STARTED:
         return
+    load_task_history()
     threading.Thread(target=task_worker_loop, daemon=True).start()
     TASK_WORKER_STARTED = True
 
@@ -125,6 +194,7 @@ def enqueue_task(task_type: str, params: dict[str, Any] | None = None) -> dict[s
     with TASK_CONDITION:
         TASKS[task_id] = task
         TASK_QUEUE.append(task_id)
+        save_task_history_unlocked()
         TASK_CONDITION.notify()
     return task_snapshot(task)
 
@@ -141,6 +211,23 @@ def list_tasks(limit: int = 20) -> dict[str, Any]:
         return {"tasks": [task_snapshot(row) for row in rows]}
 
 
+def clear_tasks(statuses: list[str] | None = None) -> dict[str, Any]:
+    allowed = set(statuses or ["completed", "failed", "cancelled"])
+    protected = {"queued", "running"}
+    with TASK_LOCK:
+        removed: list[dict[str, Any]] = []
+        for task_id, task in list(TASKS.items()):
+            status = str(task.get("status") or "")
+            if status in protected or status not in allowed:
+                continue
+            removed.append(task_snapshot(task))
+            TASKS.pop(task_id, None)
+        if removed:
+            save_task_history_unlocked()
+        rows = sorted(TASKS.values(), key=lambda item: str(item.get("created_at") or ""), reverse=True)
+        return {"removed_count": len(removed), "removed": removed, "tasks": [task_snapshot(row) for row in rows[:20]]}
+
+
 def update_task(task_id: str, **updates: Any) -> dict[str, Any] | None:
     with TASK_LOCK:
         task = TASKS.get(task_id)
@@ -148,7 +235,9 @@ def update_task(task_id: str, **updates: Any) -> dict[str, Any] | None:
             return None
         task.update(updates)
         task["updated_at"] = now_iso()
-        return task_snapshot(task)
+        snapshot = task_snapshot(task)
+        save_task_history_unlocked()
+        return snapshot
 
 
 def task_cancel_requested(task_id: str | None) -> bool:
@@ -171,8 +260,10 @@ def cancel_task(task_id: str) -> dict[str, Any]:
             if task_id in TASK_QUEUE:
                 TASK_QUEUE.remove(task_id)
         task["updated_at"] = now_iso()
+        snapshot = task_snapshot(task)
+        save_task_history_unlocked()
         TASK_CONDITION.notify()
-        return task_snapshot(task)
+        return snapshot
 
 
 def task_worker_loop() -> None:
@@ -187,6 +278,7 @@ def task_worker_loop() -> None:
             task["status"] = "running"
             task["started_at"] = now_iso()
             task["updated_at"] = now_iso()
+            save_task_history_unlocked()
             task_type = str(task.get("type"))
             params = dict(task.get("params") or {})
         try:
@@ -207,6 +299,8 @@ def run_task_payload(task_id: str, task_type: str, params: dict[str, Any]) -> di
         return compact_covered_candle_cache({**params, "task_id": task_id})
     if task_type == "joint_optimize":
         return joint_optimize_params(params)
+    if task_type == "attribution_experiments":
+        return attribution_experiments(params)
     if task_type == "readiness":
         return readiness_gate(params)
     raise ValueError(f"unsupported task type: {task_type}")
@@ -280,6 +374,47 @@ def fetch_trend_candles(inst_id: str, trend_bar: str, params: dict[str, Any]) ->
         prefer_cache=bool(params.get("prefer_cache", False)),
         offline_mode=bool(params.get("offline_mode", False)),
     )
+
+
+def trade_window_candles(params: dict[str, Any]) -> dict[str, Any]:
+    inst_id = params.get("instId") or params.get("inst_id") or "BTC-USDT-SWAP"
+    bar = params.get("bar", "15m")
+    entry_time = params.get("entry_time")
+    exit_time = params.get("exit_time") or entry_time
+    entry_ts = int(datetime.fromisoformat(str(entry_time).replace("Z", "+00:00")).timestamp() * 1000)
+    exit_ts = int(datetime.fromisoformat(str(exit_time).replace("Z", "+00:00")).timestamp() * 1000)
+    before = int(params.get("before", 80))
+    after = int(params.get("after", 60))
+    bar_ms = max(bar_to_ms(bar), 1)
+    target_end = max(entry_ts, exit_ts) + after * bar_ms
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    history_hours = max(24.0, (now_ms - min(entry_ts, exit_ts)) / 3_600_000 + 24.0)
+    count = min(5000, max(240, int(history_hours * 3_600_000 / bar_ms) + before + after + 20))
+    candles = fetch_historical_candles(
+        str(inst_id),
+        str(bar),
+        count,
+        prefer_cache=bool(params.get("prefer_cache", True)),
+        offline_mode=bool(params.get("offline_mode", False)),
+    )
+    start_ts = min(entry_ts, exit_ts) - before * bar_ms
+    end_ts = target_end
+    window = [row for row in candles if start_ts <= int(row.get("ts", 0)) <= end_ts]
+    if len(window) > before + after + 120:
+        window = window[-(before + after + 120):]
+    meta = last_candle_fetch(str(inst_id), str(bar), count)
+    return {
+        "inst_id": inst_id,
+        "bar": bar,
+        "entry_time": entry_time,
+        "exit_time": exit_time,
+        "entry_ts": entry_ts,
+        "exit_ts": exit_ts,
+        "candles": window,
+        "count": len(window),
+        "source_count": len(candles),
+        "data": meta or {},
+    }
 
 
 def symbol_slippage_multiplier(inst_id: str | None) -> float:
@@ -2469,6 +2604,11 @@ def portfolio_attribution(params: dict[str, Any]) -> dict[str, Any]:
 def attribution_experiments(params: dict[str, Any]) -> dict[str, Any]:
     base_short_factor = float(params.get("short_trend_risk_factor", 1.0))
     base_breakout_factor = float(params.get("breakout_risk_factor", 0.55))
+    base_risk_pct = float(params.get("risk_pct", params.get("max_loss_pct_per_trade", 0.10)))
+    base_min_signal_score = float(params.get("min_signal_score", -999))
+    base_loss_pause = int(params.get("loss_streak_pause_bars", 0) or 0)
+    base_time_exit = int(params.get("time_exit_bars", 0) or 0)
+    base_time_exit_rr = float(params.get("time_exit_min_rr", 0.25))
     candidates = [
         ("当前参数", {}, "保持当前参数，用作对照。"),
         ("空头趋势降权 0.95", {"short_trend_risk_factor": 0.95}, "轻微降低 short trend 环境风险。"),
@@ -2481,19 +2621,60 @@ def attribution_experiments(params: dict[str, Any]) -> dict[str, Any]:
             {"short_trend_risk_factor": 0.85, "breakout_risk_factor": 0.30},
             "同时处理 short trend 和突破测试两个弱点。",
         ),
+        (
+            "过滤逆势突破测试",
+            {"block_breakout_against_trend": True},
+            "归因显示突破测试容易在反向高周期趋势中失效，测试直接过滤这类入场。",
+        ),
+        ("连亏暂停 24K", {"loss_streak_pause_bars": 24}, "连续亏损触发后暂停 24 根 K，测试能否避开连亏段。"),
+        ("连亏暂停 48K", {"loss_streak_pause_bars": 48}, "更强暂停，优先压低最差窗口和最大回撤。"),
+        ("时间止损 24K", {"time_exit_bars": 24, "time_exit_min_rr": 0.0}, "持仓 24 根 K 后仍未到 0R 就退出，减少无效占用。"),
+        ("时间止损 32K", {"time_exit_bars": 32, "time_exit_min_rr": 0.25}, "持仓 32 根 K 后仍低于 0.25R 就退出，测试慢单质量。"),
+        ("评分提高 0.65", {"min_signal_score": 0.65}, "提高最低信号评分，减少边缘信号。"),
+        ("风险减半", {"risk_pct": base_risk_pct * 0.5, "max_loss_pct_per_trade": base_risk_pct * 0.5}, "降低单笔风险，检查收益/回撤是否更稳。"),
+        (
+            "稳健组合",
+            {
+                "block_breakout_against_trend": True,
+                "loss_streak_pause_bars": 24,
+                "min_signal_score": max(base_min_signal_score, 0.60),
+                "risk_pct": base_risk_pct * 0.75,
+                "max_loss_pct_per_trade": base_risk_pct * 0.75,
+            },
+            "组合使用逆势突破过滤、连亏暂停、轻微提分和降风险，优先改善弱窗口。",
+        ),
     ]
-    seen: set[tuple[float, float]] = set()
+    seen: set[tuple[float, float, bool, float, int, int, float, float]] = set()
     rows = []
     for name, overrides, note in candidates:
+        risk_pct = float(overrides.get("risk_pct", base_risk_pct))
         run_params = {
             **params,
             "symbols": params.get("symbols") or ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"],
             "short_trend_risk_factor": float(overrides.get("short_trend_risk_factor", base_short_factor)),
             "breakout_risk_factor": float(overrides.get("breakout_risk_factor", base_breakout_factor)),
+            "block_breakout_against_trend": bool(
+                overrides.get("block_breakout_against_trend", params.get("block_breakout_against_trend", False))
+            ),
+            "risk_pct": risk_pct,
+            "max_loss_pct_per_trade": float(overrides.get("max_loss_pct_per_trade", risk_pct)),
+            "min_signal_score": float(overrides.get("min_signal_score", base_min_signal_score)),
+            "loss_streak_pause_bars": int(overrides.get("loss_streak_pause_bars", base_loss_pause) or 0),
+            "time_exit_bars": int(overrides.get("time_exit_bars", base_time_exit) or 0),
+            "time_exit_min_rr": float(overrides.get("time_exit_min_rr", base_time_exit_rr)),
             "prefer_cache": True,
             "offline_mode": True,
         }
-        key = (run_params["short_trend_risk_factor"], run_params["breakout_risk_factor"])
+        key = (
+            run_params["short_trend_risk_factor"],
+            run_params["breakout_risk_factor"],
+            run_params["block_breakout_against_trend"],
+            run_params["risk_pct"],
+            run_params["loss_streak_pause_bars"],
+            run_params["time_exit_bars"],
+            run_params["time_exit_min_rr"],
+            run_params["min_signal_score"],
+        )
         if key in seen:
             continue
         seen.add(key)
@@ -2514,13 +2695,16 @@ def attribution_experiments(params: dict[str, Any]) -> dict[str, Any]:
                 if robust.get("rolling_cases")
                 else 0.0
             )
+            worst_window = float(robust.get("rolling_worst_return_pct") or 0.0)
+            stress_worst = float(robust.get("stress_worst_return_pct") or 0.0)
             score = (
                 float(summary.get("return_pct") or 0.0)
                 + monthly * 0.35
                 + (float(summary.get("profit_factor") or 0.0) - 1.0) * 0.12
                 + rolling_ratio * 0.12
                 - float(summary.get("max_drawdown") or 0.0) * 1.15
-                - max(0.0, -float(robust.get("rolling_worst_return_pct") or 0.0)) * 0.45
+                - max(0.0, -worst_window) * 0.45
+                - max(0.0, -stress_worst) * 0.25
             )
             rows.append(
                 {
@@ -2528,12 +2712,20 @@ def attribution_experiments(params: dict[str, Any]) -> dict[str, Any]:
                     "params": {
                         "short_trend_risk_factor": run_params["short_trend_risk_factor"],
                         "breakout_risk_factor": run_params["breakout_risk_factor"],
+                        "block_breakout_against_trend": run_params["block_breakout_against_trend"],
+                        "risk_pct": run_params["risk_pct"],
+                        "min_signal_score": run_params["min_signal_score"],
+                        "loss_streak_pause_bars": run_params["loss_streak_pause_bars"],
+                        "time_exit_bars": run_params["time_exit_bars"],
+                        "time_exit_min_rr": run_params["time_exit_min_rr"],
                     },
                     "note": note,
                     "summary": summary,
                     "monthly_return": monthly,
                     "robust": robust,
                     "rolling_ratio": rolling_ratio,
+                    "worst_window_return": worst_window,
+                    "stress_worst_return": stress_worst,
                     "score": score,
                     "status": "通过" if rolling_ratio >= 0.65 and float(summary.get("return_pct") or 0.0) > 0 else "观察",
                 }
@@ -2545,6 +2737,12 @@ def attribution_experiments(params: dict[str, Any]) -> dict[str, Any]:
                     "params": {
                         "short_trend_risk_factor": run_params["short_trend_risk_factor"],
                         "breakout_risk_factor": run_params["breakout_risk_factor"],
+                        "block_breakout_against_trend": run_params["block_breakout_against_trend"],
+                        "risk_pct": run_params["risk_pct"],
+                        "min_signal_score": run_params["min_signal_score"],
+                        "loss_streak_pause_bars": run_params["loss_streak_pause_bars"],
+                        "time_exit_bars": run_params["time_exit_bars"],
+                        "time_exit_min_rr": run_params["time_exit_min_rr"],
                     },
                     "note": note,
                     "summary": None,
@@ -2558,6 +2756,56 @@ def attribution_experiments(params: dict[str, Any]) -> dict[str, Any]:
             )
 
     valid = [row for row in rows if row.get("summary")]
+    baseline = next((row for row in valid if row.get("name") == "当前参数"), valid[0] if valid else None)
+    if baseline:
+        base_summary = baseline.get("summary") or {}
+        base_robust = baseline.get("robust") or {}
+        base_return = float(base_summary.get("return_pct") or 0.0)
+        base_drawdown = float(base_summary.get("max_drawdown") or 0.0)
+        base_score = float(baseline.get("score") or 0.0)
+        base_rolling = float(baseline.get("rolling_ratio") or 0.0)
+        base_worst = float(base_robust.get("rolling_worst_return_pct") or 0.0)
+        base_stress = float(base_robust.get("stress_worst_return_pct") or 0.0)
+        for row in valid:
+            summary = row.get("summary") or {}
+            robust = row.get("robust") or {}
+            return_delta = float(summary.get("return_pct") or 0.0) - base_return
+            drawdown_delta = float(summary.get("max_drawdown") or 0.0) - base_drawdown
+            rolling_delta = float(row.get("rolling_ratio") or 0.0) - base_rolling
+            worst_delta = float(robust.get("rolling_worst_return_pct") or 0.0) - base_worst
+            stress_delta = float(robust.get("stress_worst_return_pct") or 0.0) - base_stress
+            score_delta = float(row.get("score") or 0.0) - base_score
+            notes = []
+            if return_delta >= 0.02:
+                notes.append("收益提升")
+            elif return_delta <= -0.02:
+                notes.append("收益下降")
+            if drawdown_delta <= -0.02:
+                notes.append("回撤降低")
+            elif drawdown_delta >= 0.02:
+                notes.append("回撤升高")
+            if worst_delta >= 0.02:
+                notes.append("弱窗口改善")
+            elif worst_delta <= -0.02:
+                notes.append("弱窗口变差")
+            if stress_delta >= 0.02:
+                notes.append("压力改善")
+            elif stress_delta <= -0.02:
+                notes.append("压力变差")
+            if rolling_delta >= 0.10:
+                notes.append("滚动通过率提升")
+            elif rolling_delta <= -0.10:
+                notes.append("滚动通过率下降")
+            row["delta"] = {
+                "score": score_delta,
+                "return_pct": return_delta,
+                "max_drawdown": drawdown_delta,
+                "rolling_ratio": rolling_delta,
+                "rolling_worst_return_pct": worst_delta,
+                "stress_worst_return_pct": stress_delta,
+            }
+            row["diagnostic"] = " / ".join(notes) if notes else "接近当前参数"
+
     valid.sort(key=lambda row: row["score"], reverse=True)
     best = valid[0] if valid else None
     return {
@@ -2566,6 +2814,9 @@ def attribution_experiments(params: dict[str, Any]) -> dict[str, Any]:
             "best_score": best["score"] if best else None,
             "best_return_pct": best["summary"]["return_pct"] if best else None,
             "best_drawdown": best["summary"]["max_drawdown"] if best else None,
+            "best_worst_window": (best.get("robust") or {}).get("rolling_worst_return_pct") if best else None,
+            "best_stress_worst": (best.get("robust") or {}).get("stress_worst_return_pct") if best else None,
+            "baseline_name": baseline.get("name") if baseline else None,
             "cases": len(rows),
         },
         "rows": valid + [row for row in rows if not row.get("summary")],
@@ -2665,6 +2916,1235 @@ def compact_readiness_result(result: dict[str, Any]) -> dict[str, Any]:
         "monte_carlo": {"summary": (result.get("monte_carlo") or {}).get("summary")},
         "robustness": {"aggregate": ((result.get("robustness") or {}).get("aggregate"))},
     }
+
+
+def audit_params(params: dict[str, Any]) -> dict[str, Any]:
+    ignored = {"startup_readiness", "client_action", "order_intent", "guard", "confirmation"}
+    return {key: value for key, value in params.items() if key not in ignored}
+
+
+def stable_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def order_intent_fingerprint(intent: dict[str, Any] | None) -> str | None:
+    if not intent:
+        return None
+    payload = {
+        "inst_id": intent.get("inst_id"),
+        "bar": intent.get("bar"),
+        "side": intent.get("side"),
+        "kind": intent.get("kind"),
+        "context_time": intent.get("context_time"),
+        "entry": audit_number(intent.get("entry")),
+        "stop": audit_number(intent.get("stop")),
+        "take_profit": audit_number(intent.get("take_profit")),
+        "qty": audit_number(intent.get("qty"), 8),
+        "notional": audit_number(intent.get("notional"), 4),
+        "leverage": audit_number(intent.get("leverage"), 4),
+    }
+    return hashlib.sha256(stable_json(payload).encode("utf-8")).hexdigest()[:20]
+
+
+def decimal_or_none(value: Any) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def decimal_to_audit(value: Decimal | None, digits: int = 8) -> Any:
+    if value is None:
+        return None
+    return audit_number(float(value), digits)
+
+
+def floor_to_step(value: Decimal, step: Decimal) -> Decimal:
+    if step <= 0:
+        return value
+    return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+
+def decimal_step_aligned(value: Decimal, step: Decimal) -> bool:
+    if step <= 0:
+        return True
+    return value == floor_to_step(value, step)
+
+
+def read_execution_orders(limit: int = 100) -> dict[str, Any]:
+    if not EXECUTION_ORDER_FILE.exists():
+        return {"path": str(EXECUTION_ORDER_FILE), "rows": []}
+    rows = []
+    with EXECUTION_ORDER_LOCK:
+        lines = EXECUTION_ORDER_FILE.read_text(encoding="utf-8").splitlines()[-max(1, min(limit, 1000)) :]
+    for line in lines:
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return {"path": str(EXECUTION_ORDER_FILE), "rows": list(reversed(rows))}
+
+
+def execution_order_fingerprints(limit: int = 1000) -> set[str]:
+    return {row.get("intent_fingerprint") for row in read_execution_orders(limit).get("rows", []) if row.get("intent_fingerprint")}
+
+
+def append_execution_order(row: dict[str, Any]) -> dict[str, Any]:
+    entry = {
+        "time": now_iso(),
+        **row,
+    }
+    with EXECUTION_ORDER_LOCK:
+        with EXECUTION_ORDER_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return entry
+
+
+def order_intent_from_scan(
+    inst_id: str,
+    bar: str,
+    scan: dict[str, Any],
+    params: dict[str, Any],
+    equity: float,
+    *,
+    readiness: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    position = scan.get("position") or {}
+    signal = scan.get("signal") or {}
+    context = scan.get("context") or {}
+    if scan.get("status") != "ready" or not position:
+        return None
+    entry = float(position.get("entry") or signal.get("entry") or 0)
+    stop = float(position.get("stop") or signal.get("stop") or 0)
+    notional = float(position.get("notional") or 0)
+    leverage = float(position.get("leverage") or params.get("max_leverage") or params.get("leverage") or 1)
+    return {
+        "id": f"intent-{int(time.time() * 1000)}-{random.randint(1000, 9999)}",
+        "created_at": now_iso(),
+        "dry_run": True,
+        "inst_id": inst_id,
+        "bar": bar,
+        "side": position.get("side") or signal.get("side"),
+        "kind": signal.get("kind") or position.get("kind"),
+        "order_type": params.get("entry_order_type", "taker"),
+        "entry": entry,
+        "stop": stop,
+        "take_profit": float(position.get("take_profit") or signal.get("take_profit") or 0),
+        "qty": float(position.get("qty") or 0),
+        "notional": notional,
+        "margin_used": float(position.get("margin_used") or 0),
+        "leverage": leverage,
+        "liquidation_price": position.get("liquidation_price"),
+        "planned_risk": position.get("planned_risk"),
+        "risk_pct_of_equity": (float(position.get("planned_risk") or 0) / equity) if equity > 0 else None,
+        "stop_distance_pct": abs(entry - stop) / max(entry, 1e-9) if entry and stop else None,
+        "reason": scan.get("decision"),
+        "context_time": context.get("time"),
+        "readiness_decision": readiness.get("decision") if readiness else None,
+        "readiness_score": readiness.get("score") if readiness else None,
+        "scan_signature": paper_scan_signature(scan),
+    }
+
+
+def execution_guard(
+    intent: dict[str, Any] | None,
+    params: dict[str, Any],
+    paper_snapshot: dict[str, Any],
+    readiness: dict[str, Any] | None = None,
+    *,
+    duplicate_intent: bool = False,
+    intent_fingerprint: str | None = None,
+    okx_account: dict[str, Any] | None = None,
+    okx_positions: dict[str, Any] | None = None,
+    exchange_rules: dict[str, Any] | None = None,
+    equity_source: str = "paper",
+) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+
+    def add(name: str, passed: bool, value: Any, threshold: str, action: str, severity: str = "fail") -> None:
+        checks.append(
+            {
+                "name": name,
+                "passed": bool(passed),
+                "value": value,
+                "threshold": threshold,
+                "action": action,
+                "severity": severity,
+                "status": "pass" if passed else severity,
+            }
+        )
+
+    add("实盘总开关", LIVE_TRADING_ENABLED, LIVE_TRADING_ENABLED, "LIVE_TRADING_ENABLED=true", "默认禁止真实下单，只允许 dry-run。", "live_lock")
+    readiness_decision = readiness.get("decision") if readiness else None
+    add("准入状态", bool(readiness_decision and "允许" in str(readiness_decision)), readiness_decision or "未检查", "包含允许", "先通过准入检查。")
+    add("订单意图", intent is not None, intent.get("id") if intent else "无", "ready signal", "没有 ready 信号时不生成订单。")
+    add("幂等检查", not duplicate_intent, intent_fingerprint or "无", "未见重复", "同一信号订单意图已记录，禁止重复提交。")
+    okx_readonly_ok = bool(okx_account and okx_account.get("ok"))
+    add("OKX只读账户", okx_readonly_ok, equity_source, "okx_readonly", "实盘前建议配置只读账户；未配置时仅允许模拟权益 dry-run。", "warn")
+
+    equity = float(
+        (okx_account or {}).get("total_equity_usd")
+        if okx_readonly_ok and (okx_account or {}).get("total_equity_usd") is not None
+        else paper_snapshot.get("equity") or params.get("initial_equity") or 0
+    )
+    position_open = bool(paper_snapshot.get("position"))
+    okx_position_count = int((okx_positions or {}).get("count") or 0)
+    day_trades = int(paper_snapshot.get("day_trades") or 0)
+    max_daily_trades = int(params.get("max_daily_trades", 9999))
+    add("无已有仓位", not position_open, "有仓位" if position_open else "空仓", "空仓", "已有仓位时禁止新开仓。")
+    add("OKX无真实持仓", okx_position_count == 0, okx_position_count, "0", "OKX 已有真实持仓时禁止新开仓。")
+    add("日内次数", day_trades < max_daily_trades, day_trades, f"< {max_daily_trades}", "达到日内交易上限。")
+
+    if intent:
+        rule_check = (exchange_rules or {}).get("validation") or {}
+        add(
+            "OKX合约规则",
+            bool(rule_check.get("ok")),
+            rule_check.get("status") or "未校验",
+            "public instruments",
+            rule_check.get("message") or "订单必须满足 OKX 合约面值、最小张数、lot size 和 tick size。",
+        )
+        leverage = float(intent.get("leverage") or 0)
+        max_leverage = float(params.get("max_leverage", params.get("leverage", leverage)))
+        margin_used = float(intent.get("margin_used") or 0)
+        margin_pct = margin_used / max(equity, 1e-9)
+        max_margin_pct = float(params.get("max_margin_pct", params.get("margin_pct_per_trade", 1.0)))
+        risk_pct = float(intent.get("risk_pct_of_equity") or 0)
+        max_loss_pct = float(params.get("max_loss_pct_per_trade", params.get("risk_pct", 0.01)))
+        entry = float(intent.get("entry") or 0)
+        stop = float(intent.get("stop") or 0)
+        liquidation_price = intent.get("liquidation_price")
+        liq_buffer_pct = None
+        if liquidation_price is not None and entry:
+            liq_buffer_pct = (abs(entry - float(liquidation_price)) - abs(entry - stop)) / entry
+        min_liq_buffer = float(params.get("min_liq_buffer_pct", 0.003))
+        add("杠杆上限", leverage <= max_leverage, leverage, f"<= {max_leverage:g}x", "降低杠杆或仓位。")
+        add("保证金占用", margin_pct <= max_margin_pct, margin_pct, f"<= {max_margin_pct:.0%}", "降低名义金额。")
+        add("单笔风险", risk_pct <= max_loss_pct, risk_pct, f"<= {max_loss_pct:.0%}", "降低 risk_pct 或放弃信号。")
+        add("强平缓冲", liq_buffer_pct is not None and liq_buffer_pct >= min_liq_buffer, liq_buffer_pct, f">= {min_liq_buffer:.2%}", "强平价必须比止损更远。")
+
+    hard_fails = [row for row in checks if not row["passed"] and row["severity"] == "fail"]
+    live_lock = [row for row in checks if not row["passed"] and row["severity"] == "live_lock"]
+    return {
+        "live_trading_enabled": LIVE_TRADING_ENABLED,
+        "equity": equity,
+        "equity_source": equity_source,
+        "okx_readonly_ok": okx_readonly_ok,
+        "okx_position_count": okx_position_count,
+        "allow_dry_run": intent is not None and not hard_fails,
+        "allow_live": intent is not None and not hard_fails and not live_lock,
+        "decision": "允许实盘" if intent is not None and not hard_fails and not live_lock else "仅 dry-run" if intent is not None and not hard_fails else "阻断",
+        "checks": checks,
+        "blocked_reasons": [row["action"] for row in hard_fails + live_lock if not row["passed"]],
+    }
+
+
+def execution_data_quality(scan: dict[str, Any] | None) -> dict[str, Any]:
+    data = (scan or {}).get("data") or {}
+    price = data.get("price") or {}
+    trend = data.get("trend") or {}
+    price_ok = bool(price) and not bool(price.get("is_stale"))
+    trend_ok = not trend or not bool(trend.get("is_stale"))
+    source = price.get("source") or "-"
+    latest_closed = price.get("latest_closed") or "-"
+    age_seconds = price.get("latest_closed_age_seconds")
+    stale_after = price.get("stale_after_seconds")
+    reasons = []
+    if not price:
+      reasons.append("缺少价格行情元数据")
+    elif price.get("is_stale"):
+      reasons.append("价格行情已陈旧")
+    if trend and trend.get("is_stale"):
+      reasons.append("趋势行情已陈旧")
+    if source.startswith("okx-error") or "stale" in str(source):
+      reasons.append(f"行情来源为 {source}")
+    ok = price_ok and trend_ok and not any("stale" in reason for reason in reasons)
+    return {
+        "ok": ok,
+        "status": "fresh" if ok else "stale",
+        "mode": data.get("mode"),
+        "source": source,
+        "latest_closed": latest_closed,
+        "latest_closed_age_seconds": age_seconds,
+        "stale_after_seconds": stale_after,
+        "trend_source": trend.get("source") if trend else None,
+        "trend_latest_closed": trend.get("latest_closed") if trend else None,
+        "message": "行情新鲜，可用于实盘前预演。" if ok else "；".join(reasons) or "行情新鲜度未通过。",
+    }
+
+
+def execution_scan_history_hours(bar: str, params: dict[str, Any]) -> float:
+    explicit = params.get("execution_scan_history_hours")
+    if explicit is not None:
+        try:
+            return max(1.0, float(explicit))
+        except (TypeError, ValueError):
+            pass
+
+    max_live_candles = max(120, int(params.get("execution_max_live_candles", 280)))
+    price_bar_hours = bar_to_ms(bar) / 3_600_000
+    price_warmup = strategy_warmup_candles(params)
+    price_window = max(12, max_live_candles - price_warmup - 2)
+    candidates = [price_window * price_bar_hours]
+
+    if uses_trend_context(params.get("strategy_mode", "louie_price_action")):
+        trend_bar = params.get("trend_bar", "1H")
+        trend_bar_hours = bar_to_ms(trend_bar) / 3_600_000
+        trend_warmup = int(params.get("trend_slow", 120)) + 20
+        trend_window = max(12, max_live_candles - trend_warmup - 2)
+        candidates.append(trend_window * trend_bar_hours)
+
+    history_cap = min(float(params.get("history_hours", 2160)), float(params.get("execution_scan_history_cap_hours", 240)))
+    return max(1.0, min(history_cap, *candidates))
+
+
+def final_submission_gate(
+    intent: dict[str, Any] | None,
+    guard: dict[str, Any],
+    okx_account: dict[str, Any] | None,
+    okx_positions: dict[str, Any] | None,
+    exchange_rules: dict[str, Any] | None,
+    okx_order: dict[str, Any] | None,
+    params: dict[str, Any],
+    *,
+    duplicate_intent: bool = False,
+    data_quality: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    checks: list[dict[str, Any]] = []
+
+    def safe_float(value: Any, fallback: float = 0.0) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return fallback
+        return number if math.isfinite(number) else fallback
+
+    def add(name: str, passed: bool, value: Any, threshold: str, action: str, severity: str = "fail") -> None:
+        checks.append(
+            {
+                "name": name,
+                "passed": bool(passed),
+                "value": value,
+                "threshold": threshold,
+                "action": action,
+                "severity": severity,
+                "status": "pass" if passed else severity,
+            }
+        )
+
+    okx_readonly_ok = bool(okx_account and okx_account.get("ok"))
+    okx_position_count = int((okx_positions or {}).get("count") or 0) if (okx_positions or {}).get("ok") else 0
+    account_equity = safe_float((okx_account or {}).get("total_equity_usd"))
+    min_live_equity = safe_float(params.get("min_live_equity_usd", params.get("initial_equity", 10)), 10.0)
+    margin_used = safe_float((intent or {}).get("margin_used"))
+    margin_buffer_mult = safe_float(params.get("live_margin_buffer_mult", 1.2), 1.2)
+    required_margin_buffer = margin_used * margin_buffer_mult if intent else 0.0
+    validation = (exchange_rules or {}).get("validation") or {}
+    payload_ready = bool(okx_order and okx_order.get("ok"))
+
+    add("订单意图", intent is not None, intent.get("id") if intent else "无", "dry-run intent", "先生成带 ready 信号的执行预演。")
+    add("预演保护", bool(guard.get("allow_dry_run")), guard.get("decision") or "未通过", "allow_dry_run=true", "执行保护未通过，不能进入最终提交队列。")
+    add("行情新鲜度", bool(data_quality and data_quality.get("ok")), (data_quality or {}).get("status", "unknown"), "fresh", (data_quality or {}).get("message") or "先使用最新 OKX 行情完成预演。")
+    add("OKX只读连通", okx_readonly_ok, "已连接" if okx_readonly_ok else (okx_account or {}).get("error", "未连接"), "account/balance ok", "先通过 OKX 只读账户诊断。")
+    add("账户最低权益", account_equity >= min_live_equity, account_equity, f">= {min_live_equity:g} USDT", "账户权益不足，先入金或降低 min_live_equity_usd。")
+    add(
+        "保证金缓冲",
+        intent is not None and account_equity >= required_margin_buffer,
+        account_equity,
+        f">= {required_margin_buffer:.4f} USDT",
+        "账户权益不足以覆盖计划保证金缓冲。" if intent else "先生成订单意图后再校验保证金缓冲。",
+    )
+    add("真实持仓为空", okx_position_count == 0, okx_position_count, "0", "已有真实持仓时不允许新开仓。")
+    add("交易所规则", bool(validation.get("ok")), validation.get("status") or "未校验", "valid", validation.get("message") or "订单必须通过 OKX 合约规则校验。")
+    add("OKX payload", payload_ready, (okx_order or {}).get("status") or "missing", "ready", (okx_order or {}).get("message") or "先生成可审计的 OKX 下单 payload。")
+    add("幂等检查", not duplicate_intent, order_intent_fingerprint(intent) or "无", "未见重复", "同一订单意图已记录，拒绝重复提交。")
+    add("实盘总开关", LIVE_TRADING_ENABLED, LIVE_TRADING_ENABLED, "LIVE_TRADING_ENABLED=true", "当前仍保持真实下单总锁关闭。", "live_lock")
+    add("连接器实现", False, "not_configured", "OKX live connector", "真实下单连接器尚未开放。", "live_lock")
+
+    blocked = [row for row in checks if not row["passed"]]
+    live_locks = [row for row in blocked if row["severity"] == "live_lock"]
+    hard_fails = [row for row in blocked if row["severity"] != "live_lock"]
+    return {
+        "allow_submit": not blocked,
+        "ready_except_live_lock": not hard_fails and bool(live_locks),
+        "decision": "可提交" if not blocked else "仅差实盘锁" if not hard_fails else "不可提交",
+        "checks": checks,
+        "blocked_reasons": [row["action"] for row in blocked],
+        "account_equity": account_equity,
+        "min_live_equity_usd": min_live_equity,
+        "required_margin_buffer": required_margin_buffer,
+        "okx_position_count": okx_position_count,
+        "updated_at": now_iso(),
+    }
+
+
+def execution_dry_run(params: dict[str, Any]) -> dict[str, Any]:
+    run_params = audit_params(
+        {
+            **params,
+            "symbols": params.get("symbols") or ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"],
+            "prefer_cache": bool(params.get("execution_prefer_cache", False)),
+            "offline_mode": bool(params.get("execution_offline_mode", False)),
+        }
+    )
+    with paper_lock:
+        snapshot = paper_state_payload(paper_state)
+    inst_id = run_params.get("instId") or run_params.get("inst_id") or snapshot.get("inst_id") or "BTC-USDT-SWAP"
+    bar = run_params.get("bar") or snapshot.get("bar") or "15m"
+    okx_account = okx_account_readonly()
+    okx_positions = okx_positions_readonly({"instType": "SWAP"})
+    okx_equity = okx_account.get("total_equity_usd") if okx_account.get("ok") else None
+    equity = float(okx_equity if okx_equity is not None else snapshot.get("equity") or run_params.get("initial_equity") or 10)
+    equity_source = "okx_readonly" if okx_equity is not None else "paper"
+    readiness = readiness_gate(run_params)
+    scan = diagnose_signal_for_market(
+        inst_id,
+        {
+            **run_params,
+            "bar": bar,
+            "scan_history_hours": execution_scan_history_hours(bar, run_params),
+            "account_peak": snapshot.get("peak_equity") or equity,
+            "day_start_equity": snapshot.get("day_start_equity") or equity,
+            "loss_streak": snapshot.get("consecutive_losses") or 0,
+            "record_scan": False,
+        },
+        equity,
+    )
+    data_quality = execution_data_quality(scan)
+    intent = order_intent_from_scan(inst_id, bar, scan, run_params, equity, readiness=readiness)
+    instrument_rules = okx_instrument_rules(inst_id)
+    exchange_rules = {
+        "instrument": instrument_rules,
+        "validation": okx_order_validation(intent, instrument_rules),
+    }
+    intent_fingerprint = order_intent_fingerprint(intent)
+    okx_order = okx_order_payload_preview(intent, exchange_rules["validation"], run_params, intent_fingerprint)
+    duplicate_intent = bool(intent_fingerprint and intent_fingerprint in execution_order_fingerprints())
+    guard = execution_guard(
+        intent,
+        run_params,
+        snapshot,
+        readiness,
+        duplicate_intent=duplicate_intent,
+        intent_fingerprint=intent_fingerprint,
+        okx_account=okx_account,
+        okx_positions=okx_positions,
+        exchange_rules=exchange_rules,
+        equity_source=equity_source,
+    )
+    final_gate = final_submission_gate(
+        intent,
+        guard,
+        okx_account,
+        okx_positions,
+        exchange_rules,
+        okx_order,
+        run_params,
+        duplicate_intent=duplicate_intent,
+        data_quality=data_quality,
+    )
+    order_status = "duplicate" if duplicate_intent else "candidate" if intent else "no_intent"
+    result = {
+        "mode": "dry_run",
+        "live_trading_enabled": LIVE_TRADING_ENABLED,
+        "order_intent": intent,
+        "intent_fingerprint": intent_fingerprint,
+        "execution_order": {
+            "status": order_status,
+            "intent_fingerprint": intent_fingerprint,
+            "duplicate_intent": duplicate_intent,
+        },
+        "guard": guard,
+        "final_gate": final_gate,
+        "data_quality": data_quality,
+        "readiness": compact_readiness_result(readiness),
+        "scan": compact_paper_scan(scan),
+        "paper": {
+            "running": snapshot.get("running"),
+            "equity": snapshot.get("equity"),
+            "position_open": bool(snapshot.get("position")),
+            "day_trades": snapshot.get("day_trades"),
+        },
+        "okx": {
+            "account_ok": okx_account.get("ok"),
+            "configured": okx_account.get("configured"),
+            "equity": okx_equity,
+            "positions": okx_positions.get("positions", []),
+            "position_count": okx_positions.get("count") if okx_positions.get("ok") else 0,
+            "error": okx_account.get("error") or okx_positions.get("error"),
+        },
+        "equity_source": equity_source,
+        "exchange_rules": exchange_rules,
+        "okx_order": okx_order,
+    }
+    append_execution_order(
+        {
+            "event": "dry_run",
+            "status": order_status,
+            "intent_fingerprint": intent_fingerprint,
+            "duplicate_intent": duplicate_intent,
+            "inst_id": inst_id,
+            "bar": bar,
+            "side": intent.get("side") if intent else None,
+            "notional": intent.get("notional") if intent else None,
+            "order_intent": intent,
+            "guard_decision": guard.get("decision"),
+            "allow_live": guard.get("allow_live"),
+            "allow_dry_run": guard.get("allow_dry_run"),
+            "equity_source": equity_source,
+            "okx_position_count": result["okx"].get("position_count"),
+            "exchange_validation": exchange_rules.get("validation"),
+            "okx_order": okx_order,
+            "final_gate": final_gate,
+            "data_quality": data_quality,
+            "readiness_decision": result["readiness"].get("decision"),
+        }
+    )
+    append_paper_audit(
+        {
+            "action": "execution_dry_run",
+            "inst_id": inst_id,
+            "bar": bar,
+            "strategy_mode": run_params.get("strategy_mode"),
+            "params": run_params,
+            "equity_before": equity,
+            "equity_after": equity,
+            "day_trades": snapshot.get("day_trades"),
+            "loss_streak": snapshot.get("consecutive_losses"),
+            "position_before": snapshot.get("position"),
+            "position_after": snapshot.get("position"),
+            "readiness": result["readiness"],
+            "order_intent": intent,
+            "intent_fingerprint": intent_fingerprint,
+            "execution_guard": guard,
+            "final_gate": final_gate,
+            "data_quality": data_quality,
+            "okx": result["okx"],
+            "exchange_rules": exchange_rules,
+            "okx_order": okx_order,
+            "scan": result["scan"],
+            "scan_signature": paper_scan_signature(scan),
+            "actions": [{"type": "execution_dry_run", "decision": guard.get("decision")}],
+        }
+    )
+    return result
+
+
+def execution_config() -> dict[str, Any]:
+    okx_keys = {key: bool(os.environ.get(key)) for key in OKX_ENV_KEYS}
+    okx_status = okx_credentials_status()
+    return {
+        "live_trading_enabled": LIVE_TRADING_ENABLED,
+        "okx_configured": all(okx_keys.values()),
+        "okx_keys": okx_keys,
+        "okx_base_url": OKX_API_BASE_URL,
+        "okx_simulated": okx_status["simulated"],
+        "readonly_ready": okx_status["configured"],
+        "connector": "not_configured",
+        "live_submit_available": False,
+        "confirmation_phrase": "CONFIRM_LIVE_TRADE",
+        "notes": [
+            "真实下单默认关闭。",
+            "当前版本只允许 dry-run 和锁测试，不会发送 OKX 订单。",
+        ],
+    }
+
+
+def okx_credentials_status() -> dict[str, Any]:
+    keys = {key: bool(os.environ.get(key)) for key in OKX_ENV_KEYS}
+    return {
+        "configured": all(keys.values()),
+        "keys": keys,
+        "base_url": OKX_API_BASE_URL,
+        "simulated": os.environ.get("OKX_API_SIMULATED", "").lower() in {"1", "true", "yes", "on"},
+    }
+
+
+def set_okx_session_credentials(payload: dict[str, Any]) -> dict[str, Any]:
+    values = {
+        "OKX_API_KEY": str(payload.get("api_key") or payload.get("OKX_API_KEY") or "").strip(),
+        "OKX_API_SECRET": str(payload.get("api_secret") or payload.get("OKX_API_SECRET") or "").strip(),
+        "OKX_API_PASSPHRASE": str(payload.get("api_passphrase") or payload.get("OKX_API_PASSPHRASE") or "").strip(),
+    }
+    missing = [key for key, value in values.items() if not value]
+    if missing:
+        return {
+            "ok": False,
+            "configured": False,
+            "error": f"missing fields: {', '.join(missing)}",
+            "status": okx_credentials_status(),
+        }
+    for key, value in values.items():
+        os.environ[key] = value
+    if "simulated" in payload:
+        os.environ["OKX_API_SIMULATED"] = "1" if bool(payload.get("simulated")) else ""
+    return {
+        "ok": True,
+        "configured": True,
+        "status": okx_credentials_status(),
+        "scope": "current_backend_process_only",
+        "updated_at": now_iso(),
+    }
+
+
+def okx_timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def okx_sign(timestamp: str, method: str, request_path: str, body: str = "") -> str:
+    secret = os.environ.get("OKX_API_SECRET", "")
+    message = f"{timestamp}{method.upper()}{request_path}{body}"
+    digest = hmac.new(secret.encode("utf-8"), message.encode("utf-8"), digestmod="sha256").digest()
+    return base64.b64encode(digest).decode("utf-8")
+
+
+def okx_get(request_path: str) -> dict[str, Any]:
+    status = okx_credentials_status()
+    if not status["configured"]:
+        return {
+            "ok": False,
+            "configured": False,
+            "error": "OKX API credentials are not configured",
+            "config": status,
+        }
+    timestamp = okx_timestamp()
+    headers = {
+        "OK-ACCESS-KEY": os.environ.get("OKX_API_KEY", ""),
+        "OK-ACCESS-SIGN": okx_sign(timestamp, "GET", request_path),
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": os.environ.get("OKX_API_PASSPHRASE", ""),
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": OKX_BROWSER_USER_AGENT,
+    }
+    if status.get("simulated"):
+        headers["x-simulated-trading"] = "1"
+    request = urllib.request.Request(f"{OKX_API_BASE_URL}{request_path}", headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        return {"ok": False, "configured": True, "error": f"HTTP {exc.code}: {detail}", "config": status}
+    except Exception as exc:
+        return {"ok": False, "configured": True, "error": str(exc), "config": status}
+    ok = str(payload.get("code", "")) == "0"
+    return {"ok": ok, "configured": True, "payload": payload, "error": None if ok else payload.get("msg"), "config": status}
+
+
+def okx_public_get(request_path: str) -> dict[str, Any]:
+    request = urllib.request.Request(
+        f"{OKX_API_BASE_URL}{request_path}",
+        headers={
+            "Accept": "application/json",
+            "User-Agent": OKX_BROWSER_USER_AGENT,
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        return {"ok": False, "error": f"HTTP {exc.code}: {detail}", "payload": None}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "payload": None}
+    ok = str(payload.get("code", "")) == "0"
+    return {"ok": ok, "payload": payload, "error": None if ok else payload.get("msg")}
+
+
+def okx_instrument_rules(inst_id: str, inst_type: str = "SWAP") -> dict[str, Any]:
+    query = urllib.parse.urlencode({"instType": inst_type, "instId": inst_id})
+    result = okx_public_get(f"/api/v5/public/instruments?{query}")
+    if not result.get("ok"):
+        return {
+            "ok": False,
+            "inst_id": inst_id,
+            "inst_type": inst_type,
+            "error": result.get("error"),
+            "updated_at": now_iso(),
+        }
+    rows = (result.get("payload") or {}).get("data") or []
+    row = next((item for item in rows if item.get("instId") == inst_id), rows[0] if rows else None)
+    if not row:
+        return {
+            "ok": False,
+            "inst_id": inst_id,
+            "inst_type": inst_type,
+            "error": "instrument not found",
+            "updated_at": now_iso(),
+        }
+    return {
+        "ok": True,
+        "inst_id": row.get("instId"),
+        "inst_type": row.get("instType"),
+        "state": row.get("state"),
+        "contract_value": audit_number(row.get("ctVal"), 10),
+        "contract_value_ccy": row.get("ctValCcy"),
+        "contract_multiplier": audit_number(row.get("ctMult"), 10),
+        "min_size": audit_number(row.get("minSz"), 10),
+        "lot_size": audit_number(row.get("lotSz"), 10),
+        "tick_size": audit_number(row.get("tickSz"), 10),
+        "settle_ccy": row.get("settleCcy"),
+        "uly": row.get("uly"),
+        "raw": {
+            "ctVal": row.get("ctVal"),
+            "ctValCcy": row.get("ctValCcy"),
+            "ctMult": row.get("ctMult"),
+            "minSz": row.get("minSz"),
+            "lotSz": row.get("lotSz"),
+            "tickSz": row.get("tickSz"),
+            "state": row.get("state"),
+        },
+        "updated_at": now_iso(),
+    }
+
+
+def okx_order_validation(intent: dict[str, Any] | None, rules: dict[str, Any]) -> dict[str, Any]:
+    if not intent:
+        return {"ok": False, "status": "no_intent", "message": "没有订单意图，无法校验交易所规则。"}
+    if not rules.get("ok"):
+        return {"ok": False, "status": "rules_unavailable", "message": rules.get("error") or "无法读取 OKX 合约规则。"}
+    if rules.get("state") != "live":
+        return {"ok": False, "status": "instrument_not_live", "message": f"合约状态不是 live：{rules.get('state') or '-'}"}
+
+    qty = decimal_or_none(intent.get("qty"))
+    entry = decimal_or_none(intent.get("entry"))
+    stop = decimal_or_none(intent.get("stop"))
+    take_profit = decimal_or_none(intent.get("take_profit"))
+    ct_val = decimal_or_none(rules.get("contract_value"))
+    min_size = decimal_or_none(rules.get("min_size")) or Decimal("0")
+    lot_size = decimal_or_none(rules.get("lot_size")) or Decimal("1")
+    tick_size = decimal_or_none(rules.get("tick_size")) or Decimal("0")
+    if qty is None or qty <= 0:
+        return {"ok": False, "status": "invalid_qty", "message": "订单币数量为空或小于等于 0。"}
+    if ct_val is None or ct_val <= 0:
+        return {"ok": False, "status": "invalid_contract_value", "message": "OKX 合约面值不可用。"}
+
+    raw_contracts = qty / ct_val
+    normalized_contracts = floor_to_step(raw_contracts, lot_size)
+    size_ok = normalized_contracts >= min_size and normalized_contracts > 0
+    price_fields = {"entry": entry, "stop": stop, "take_profit": take_profit}
+    normalized_prices = {
+        key: decimal_to_audit(floor_to_step(value, tick_size), 10) if value is not None and tick_size > 0 else decimal_to_audit(value, 10)
+        for key, value in price_fields.items()
+    }
+    price_aligned = {
+        key: bool(value is not None and (tick_size <= 0 or decimal_step_aligned(value, tick_size)))
+        for key, value in price_fields.items()
+    }
+    notional = normalized_contracts * ct_val * (entry or Decimal("0"))
+    status = "valid" if size_ok else "size_below_min"
+    return {
+        "ok": bool(size_ok),
+        "status": status,
+        "message": "OKX 合约规则校验通过。" if size_ok else "换算后的合约张数低于 OKX 最小下单张数。",
+        "inst_id": rules.get("inst_id"),
+        "order_size_contracts": decimal_to_audit(normalized_contracts, 10),
+        "raw_contracts": decimal_to_audit(raw_contracts, 10),
+        "contract_value": decimal_to_audit(ct_val, 10),
+        "min_size": decimal_to_audit(min_size, 10),
+        "lot_size": decimal_to_audit(lot_size, 10),
+        "tick_size": decimal_to_audit(tick_size, 10),
+        "notional_after_rounding": decimal_to_audit(notional, 6),
+        "price_aligned": price_aligned,
+        "normalized_prices": normalized_prices,
+        "warnings": [] if all(price_aligned.values()) else ["价格不是 tick size 整数倍，实盘提交前会使用 normalized_prices。"],
+    }
+
+
+def decimal_exchange_string(value: Any) -> str | None:
+    decimal_value = decimal_or_none(value)
+    if decimal_value is None:
+        return None
+    return format(decimal_value.normalize(), "f")
+
+
+def okx_order_payload_preview(
+    intent: dict[str, Any] | None,
+    validation: dict[str, Any],
+    params: dict[str, Any],
+    intent_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    if not intent:
+        return {"ok": False, "status": "no_intent", "message": "没有订单意图，无法生成 OKX 下单预览。"}
+    if not validation.get("ok"):
+        return {
+            "ok": False,
+            "status": "validation_failed",
+            "message": validation.get("message") or "交易所规则校验未通过，拒绝生成可提交 payload。",
+        }
+
+    side = str(intent.get("side") or "").lower()
+    if side not in {"long", "short"}:
+        return {"ok": False, "status": "invalid_side", "message": f"未知订单方向：{intent.get('side') or '-'}"}
+
+    entry_order_type = str(intent.get("order_type") or params.get("entry_order_type") or "taker").lower()
+    ord_type = "limit" if entry_order_type in {"maker", "limit", "post_only", "post-only"} else "market"
+    pos_side_mode = str(params.get("okx_position_mode", "long_short"))
+    td_mode = str(params.get("okx_td_mode", params.get("td_mode", "isolated")))
+    size = decimal_exchange_string(validation.get("order_size_contracts"))
+    px = decimal_exchange_string((validation.get("normalized_prices") or {}).get("entry"))
+    client_id = f"qs{intent_fingerprint or order_intent_fingerprint(intent) or int(time.time())}"[:32]
+
+    payload = {
+        "instId": intent.get("inst_id"),
+        "tdMode": td_mode,
+        "side": "buy" if side == "long" else "sell",
+        "ordType": ord_type,
+        "sz": size,
+        "clOrdId": client_id,
+        "tag": "quantstudio",
+    }
+    if pos_side_mode != "net":
+        payload["posSide"] = side
+    if ord_type == "limit":
+        payload["px"] = px
+
+    missing = [key for key in ("instId", "tdMode", "side", "ordType", "sz") if not payload.get(key)]
+    ok = not missing
+    return {
+        "ok": ok,
+        "status": "ready" if ok else "missing_fields",
+        "message": "OKX 下单 payload 预览已生成，当前不会真实提交。" if ok else f"缺少字段：{', '.join(missing)}",
+        "endpoint": "POST /api/v5/trade/order",
+        "dry_run_only": True,
+        "position_mode": pos_side_mode,
+        "payload": payload,
+        "assumptions": [
+            f"tdMode={td_mode}",
+            f"position_mode={pos_side_mode}",
+            f"entry_order_type={entry_order_type}",
+            "实盘提交仍受 LIVE_TRADING_ENABLED、确认短语、只读账户和保护检查约束。",
+        ],
+        "warnings": validation.get("warnings") or [],
+    }
+
+
+def okx_account_readonly() -> dict[str, Any]:
+    result = okx_get("/api/v5/account/balance")
+    if not result.get("ok"):
+        return result
+    data = (result.get("payload") or {}).get("data") or []
+    account = data[0] if data else {}
+    details = account.get("details") or []
+    return {
+        "ok": True,
+        "configured": True,
+        "config": result.get("config"),
+        "total_equity_usd": audit_number(account.get("totalEq"), 6),
+        "adjusted_equity_usd": audit_number(account.get("adjEq"), 6),
+        "isolated_equity_usd": audit_number(account.get("isoEq"), 6),
+        "details": [
+            {
+                "ccy": row.get("ccy"),
+                "equity": audit_number(row.get("eq"), 8),
+                "cash_balance": audit_number(row.get("cashBal"), 8),
+                "available_balance": audit_number(row.get("availBal"), 8),
+                "available_equity": audit_number(row.get("availEq"), 8),
+                "frozen_balance": audit_number(row.get("frozenBal"), 8),
+                "u_pnl": audit_number(row.get("upl"), 8),
+            }
+            for row in details
+        ],
+        "raw_code": (result.get("payload") or {}).get("code"),
+        "updated_at": now_iso(),
+    }
+
+
+def okx_positions_readonly(params: dict[str, Any] | None = None) -> dict[str, Any]:
+    params = params or {}
+    query: dict[str, str] = {}
+    if params.get("instType"):
+        query["instType"] = str(params.get("instType"))
+    if params.get("instId"):
+        query["instId"] = str(params.get("instId"))
+    request_path = "/api/v5/account/positions"
+    if query:
+        request_path = f"{request_path}?{urllib.parse.urlencode(query)}"
+    result = okx_get(request_path)
+    if not result.get("ok"):
+        return result
+    rows = (result.get("payload") or {}).get("data") or []
+    positions = [
+        {
+            "inst_id": row.get("instId"),
+            "inst_type": row.get("instType"),
+            "margin_mode": row.get("mgnMode"),
+            "pos_side": row.get("posSide"),
+            "side": row.get("posSide") or ("long" if float(row.get("pos") or 0) > 0 else "short" if float(row.get("pos") or 0) < 0 else "net"),
+            "pos": audit_number(row.get("pos"), 8),
+            "avg_px": audit_number(row.get("avgPx"), 8),
+            "mark_px": audit_number(row.get("markPx"), 8),
+            "notional_usd": audit_number(row.get("notionalUsd"), 6),
+            "margin": audit_number(row.get("margin"), 8),
+            "u_pnl": audit_number(row.get("upl"), 8),
+            "u_pnl_ratio": audit_number(row.get("uplRatio"), 8),
+            "liq_px": audit_number(row.get("liqPx"), 8),
+            "leverage": audit_number(row.get("lever"), 4),
+            "updated_at": row.get("uTime"),
+        }
+        for row in rows
+        if abs(float(row.get("pos") or 0)) > 0
+    ]
+    return {
+        "ok": True,
+        "configured": True,
+        "config": result.get("config"),
+        "positions": positions,
+        "count": len(positions),
+        "raw_count": len(rows),
+        "updated_at": now_iso(),
+    }
+
+
+def okx_diagnostic_actions(category: str) -> list[str]:
+    actions = {
+        "readonly_ok": [
+            "只读 API 连通正常。",
+            "继续保持 API Key 不开启交易和提现权限。",
+        ],
+        "missing_credentials": [
+            "在后端运行环境配置 OKX_API_KEY、OKX_API_SECRET、OKX_API_PASSPHRASE。",
+            "建议使用只读 API Key，不开启交易和提现权限。",
+            "配置后重启后端服务再运行诊断。",
+        ],
+        "network_timeout": [
+            "检查当前机器到 OKX API 的网络连通性。",
+            "确认代理、防火墙或 DNS 没有阻断 https://www.okx.com。",
+            "稍后重试诊断，避免短时 API 波动误判。",
+        ],
+        "ip_not_allowed": [
+            "检查 OKX API Key 的 IP 白名单。",
+            "把当前后端出口 IP 加入白名单，或关闭白名单后重新创建只读 Key。",
+            "确认生产环境和本机开发环境使用的出口 IP 不同。",
+        ],
+        "permission_denied": [
+            "确认 API Key 至少具备读取账户信息的权限。",
+            "不要开启提现权限；实盘提交前再单独评估交易权限。",
+        ],
+        "auth_failed": [
+            "确认 OKX_API_KEY、OKX_API_SECRET、OKX_API_PASSPHRASE 三项来自同一个 API Key。",
+            "检查 passphrase 是否包含空格或转义字符。",
+            "如果刚创建或修改 Key，等待几分钟后再重试。",
+        ],
+        "timestamp_or_signature": [
+            "同步本机系统时间，OKX 签名依赖 UTC 时间戳。",
+            "确认 OKX_API_SECRET 没有换行或多余空格。",
+            "确认请求路径和签名路径一致。",
+        ],
+        "okx_rejected": [
+            "查看 OKX 返回码和错误信息。",
+            "确认账户类型、模拟盘标记和 API Key 环境一致。",
+        ],
+    }
+    return actions.get(category, actions["okx_rejected"])
+
+
+def okx_error_category(result: dict[str, Any]) -> str:
+    if result.get("ok"):
+        return "readonly_ok"
+    if not result.get("configured"):
+        return "missing_credentials"
+    error = str(result.get("error") or "")
+    payload = result.get("payload") or {}
+    code = str(payload.get("code") or "")
+    text = f"{code} {error} {json.dumps(payload, ensure_ascii=False)}".lower()
+    if "timed out" in text or "timeout" in text:
+        return "network_timeout"
+    if "ip" in text and ("white" in text or "bind" in text or "allow" in text or "invalid" in text):
+        return "ip_not_allowed"
+    if "permission" in text or "permissions" in text or "access denied" in text or code in {"50120"}:
+        return "permission_denied"
+    if "timestamp" in text or "sign" in text or "signature" in text or code in {"50102", "50113"}:
+        return "timestamp_or_signature"
+    if "passphrase" in text or "api key" in text or "apikey" in text or code in {"50101", "50103", "50104", "50105"}:
+        return "auth_failed"
+    return "okx_rejected"
+
+
+def okx_diagnostic_step(name: str, result: dict[str, Any]) -> dict[str, Any]:
+    payload = result.get("payload") or {}
+    return {
+        "name": name,
+        "ok": bool(result.get("ok")),
+        "configured": bool(result.get("configured")),
+        "category": okx_error_category(result),
+        "code": payload.get("code"),
+        "message": result.get("error") or payload.get("msg") or ("ok" if result.get("ok") else "-"),
+    }
+
+
+def okx_diagnostics() -> dict[str, Any]:
+    status = okx_credentials_status()
+    credentials_step = {
+        "name": "credentials",
+        "ok": bool(status.get("configured")),
+        "configured": bool(status.get("configured")),
+        "category": "readonly_ok" if status.get("configured") else "missing_credentials",
+        "code": None,
+        "message": "configured" if status.get("configured") else "missing OKX API environment variables",
+    }
+    if not status.get("configured"):
+        category = "missing_credentials"
+        return {
+            "ok": False,
+            "readonly_ok": False,
+            "category": category,
+            "status": status,
+            "local_utc": okx_timestamp(),
+            "steps": [credentials_step],
+            "actions": okx_diagnostic_actions(category),
+            "updated_at": now_iso(),
+        }
+
+    steps = [credentials_step]
+    account_config = okx_get("/api/v5/account/config")
+    steps.append(okx_diagnostic_step("account_config", account_config))
+    if not account_config.get("ok"):
+        category = okx_error_category(account_config)
+        return {
+            "ok": False,
+            "readonly_ok": False,
+            "category": category,
+            "status": status,
+            "local_utc": okx_timestamp(),
+            "steps": steps,
+            "actions": okx_diagnostic_actions(category),
+            "updated_at": now_iso(),
+        }
+
+    balance = okx_account_readonly()
+    steps.append(okx_diagnostic_step("account_balance", balance))
+    if not balance.get("ok"):
+        category = okx_error_category(balance)
+        return {
+            "ok": False,
+            "readonly_ok": False,
+            "category": category,
+            "status": status,
+            "local_utc": okx_timestamp(),
+            "steps": steps,
+            "actions": okx_diagnostic_actions(category),
+            "updated_at": now_iso(),
+        }
+
+    category = "readonly_ok"
+    return {
+        "ok": True,
+        "readonly_ok": True,
+        "category": category,
+        "status": status,
+        "local_utc": okx_timestamp(),
+        "steps": steps,
+        "actions": okx_diagnostic_actions(category),
+        "account": {
+            "total_equity_usd": balance.get("total_equity_usd"),
+            "adjusted_equity_usd": balance.get("adjusted_equity_usd"),
+        },
+        "updated_at": now_iso(),
+    }
+
+
+def okx_account_equity_or_none() -> float | None:
+    account = okx_account_readonly()
+    if not account.get("ok"):
+        return None
+    value = account.get("total_equity_usd")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def execution_environment_status() -> dict[str, Any]:
+    account = okx_account_readonly()
+    positions = okx_positions_readonly({"instType": "SWAP"}) if account.get("configured") else {
+        "ok": False,
+        "configured": False,
+        "positions": [],
+        "count": 0,
+        "error": account.get("error"),
+    }
+    return {
+        "okx_account": account,
+        "okx_positions": positions,
+        "readonly_ready": bool(account.get("ok")),
+        "position_count": int(positions.get("count") or 0) if positions.get("ok") else 0,
+        "equity_source": "okx_readonly" if account.get("ok") else "paper",
+        "updated_at": now_iso(),
+    }
+
+
+def submit_live_order_locked(params: dict[str, Any]) -> dict[str, Any]:
+    intent = params.get("order_intent") if isinstance(params.get("order_intent"), dict) else None
+    supplied_guard = params.get("guard") if isinstance(params.get("guard"), dict) else {}
+    intent_fingerprint = order_intent_fingerprint(intent)
+    inst_id = intent.get("inst_id") if intent else params.get("instId") or params.get("inst_id") or "BTC-USDT-SWAP"
+    instrument_rules = okx_instrument_rules(inst_id)
+    exchange_validation = okx_order_validation(intent, instrument_rules)
+    okx_order = okx_order_payload_preview(intent, exchange_validation, params, intent_fingerprint)
+    duplicate_intent = bool(intent_fingerprint and intent_fingerprint in execution_order_fingerprints())
+    supplied_data_quality = params.get("data_quality") if isinstance(params.get("data_quality"), dict) else None
+    okx_account = okx_account_readonly()
+    okx_positions = okx_positions_readonly({"instType": "SWAP"}) if okx_account.get("configured") else {
+        "ok": False,
+        "configured": False,
+        "positions": [],
+        "count": 0,
+        "error": okx_account.get("error"),
+    }
+    final_gate = final_submission_gate(
+        intent,
+        supplied_guard,
+        okx_account,
+        okx_positions,
+        {"instrument": instrument_rules, "validation": exchange_validation},
+        okx_order,
+        params,
+        duplicate_intent=duplicate_intent,
+        data_quality=supplied_data_quality,
+    )
+    confirmation = str(params.get("confirmation") or "")
+    config = execution_config()
+    checks = [
+        {
+            "name": "实盘总开关",
+            "passed": LIVE_TRADING_ENABLED,
+            "value": LIVE_TRADING_ENABLED,
+            "threshold": "LIVE_TRADING_ENABLED=true",
+            "action": "未开启时拒绝真实提交。",
+            "severity": "live_lock",
+            "status": "pass" if LIVE_TRADING_ENABLED else "live_lock",
+        },
+        {
+            "name": "OKX 密钥",
+            "passed": bool(config["okx_configured"]),
+            "value": "已配置" if config["okx_configured"] else "缺失",
+            "threshold": "三项密钥齐全",
+            "action": "配置 OKX_API_KEY / OKX_API_SECRET / OKX_API_PASSPHRASE。",
+            "severity": "live_lock",
+            "status": "pass" if config["okx_configured"] else "live_lock",
+        },
+        {
+            "name": "确认短语",
+            "passed": confirmation == "CONFIRM_LIVE_TRADE",
+            "value": "匹配" if confirmation == "CONFIRM_LIVE_TRADE" else "缺失或不匹配",
+            "threshold": "CONFIRM_LIVE_TRADE",
+            "action": "必须显式输入确认短语。",
+            "severity": "live_lock",
+            "status": "pass" if confirmation == "CONFIRM_LIVE_TRADE" else "live_lock",
+        },
+        {
+            "name": "订单意图",
+            "passed": intent is not None,
+            "value": intent.get("id") if intent else "无",
+            "threshold": "dry-run order_intent",
+            "action": "先生成执行预演并得到订单意图。",
+            "severity": "fail",
+            "status": "pass" if intent else "fail",
+        },
+        {
+            "name": "OKX payload预览",
+            "passed": bool(okx_order.get("ok")),
+            "value": okx_order.get("status"),
+            "threshold": "ready",
+            "action": okx_order.get("message") or "先生成可审计的 OKX 下单 payload。",
+            "severity": "fail",
+            "status": "pass" if okx_order.get("ok") else "fail",
+        },
+        {
+            "name": "连接器实现",
+            "passed": False,
+            "value": "未实现",
+            "threshold": "OKX live connector",
+            "action": "需要单独实现 OKX 下单适配器后才可真实提交。",
+            "severity": "live_lock",
+            "status": "live_lock",
+        },
+    ]
+    if duplicate_intent:
+        checks.append(
+            {
+                "name": "幂等检查",
+                "passed": False,
+                "value": intent_fingerprint,
+                "threshold": "未见重复",
+                "action": "同一订单意图已记录，拒绝重复提交。",
+                "severity": "fail",
+                "status": "fail",
+            }
+        )
+    if supplied_guard and not supplied_guard.get("allow_live"):
+        checks.append(
+            {
+                "name": "预演保护",
+                "passed": False,
+                "value": supplied_guard.get("decision", "未通过"),
+                "threshold": "allow_live=true",
+                "action": "dry-run 保护未通过，不允许真实提交。",
+                "severity": "fail",
+                "status": "fail",
+            }
+        )
+    blocked = [row for row in checks if not row["passed"]]
+    result = {
+        "ok": False,
+        "submitted": False,
+        "decision": "真实提交已锁定",
+        "config": config,
+        "order_intent": intent,
+        "exchange_rules": {"instrument": instrument_rules, "validation": exchange_validation},
+        "okx_order": okx_order,
+        "final_gate": final_gate,
+        "data_quality": supplied_data_quality,
+        "intent_fingerprint": intent_fingerprint,
+        "duplicate_intent": duplicate_intent,
+        "checks": checks,
+        "blocked_reasons": [row["action"] for row in blocked],
+    }
+    append_execution_order(
+        {
+            "event": "live_submit_rejected",
+            "status": "rejected",
+            "intent_fingerprint": intent_fingerprint,
+            "duplicate_intent": duplicate_intent,
+            "inst_id": intent.get("inst_id") if intent else params.get("instId") or params.get("inst_id"),
+            "bar": intent.get("bar") if intent else params.get("bar"),
+            "side": intent.get("side") if intent else None,
+            "notional": intent.get("notional") if intent else None,
+            "order_intent": intent,
+            "exchange_validation": exchange_validation,
+            "okx_order": okx_order,
+            "final_gate": final_gate,
+            "data_quality": supplied_data_quality,
+            "guard_decision": supplied_guard.get("decision"),
+            "allow_live": False,
+            "allow_dry_run": supplied_guard.get("allow_dry_run"),
+            "rejection_reasons": result["blocked_reasons"],
+        }
+    )
+    append_paper_audit(
+        {
+            "action": "live_submit_rejected",
+            "inst_id": intent.get("inst_id") if intent else params.get("instId") or params.get("inst_id"),
+            "bar": intent.get("bar") if intent else params.get("bar"),
+            "strategy_mode": params.get("strategy_mode"),
+            "params": audit_params(params),
+            "order_intent": intent,
+            "exchange_rules": {"instrument": instrument_rules, "validation": exchange_validation},
+            "okx_order": okx_order,
+            "intent_fingerprint": intent_fingerprint,
+            "execution_guard": supplied_guard,
+            "final_gate": final_gate,
+            "data_quality": supplied_data_quality,
+            "live_submit": result,
+            "actions": [{"type": "live_submit_rejected", "decision": result["decision"]}],
+        }
+    )
+    return result
 
 
 def safe_snapshot_label(value: str) -> str:
@@ -3023,6 +4503,208 @@ def cache_status() -> dict[str, Any]:
         **status,
         "rows": rows,
         "portfolio_result_cache": PORTFOLIO_RESULT_CACHE.status(),
+    }
+
+
+def path_status(path: Path) -> dict[str, Any]:
+    exists = path.exists()
+    result: dict[str, Any] = {
+        "path": str(path),
+        "exists": exists,
+        "size_bytes": 0,
+        "updated_at": None,
+    }
+    if not exists:
+        return result
+    try:
+        stat = path.stat()
+        result["size_bytes"] = stat.st_size
+        result["updated_at"] = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat()
+    except OSError as exc:
+        result["error"] = str(exc)
+    return result
+
+
+def cache_directory_status() -> dict[str, Any]:
+    file_count = 0
+    total_size = 0
+    newest_mtime = 0.0
+    for path in CACHE_DIR.rglob("*"):
+        if not path.is_file():
+            continue
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        file_count += 1
+        total_size += stat.st_size
+        newest_mtime = max(newest_mtime, stat.st_mtime)
+    return {
+        "path": str(CACHE_DIR),
+        "exists": CACHE_DIR.exists(),
+        "file_count": file_count,
+        "size_bytes": total_size,
+        "updated_at": datetime.fromtimestamp(newest_mtime, tz=timezone.utc).isoformat() if newest_mtime else None,
+    }
+
+
+def task_system_status() -> dict[str, Any]:
+    with TASK_LOCK:
+        rows = list(TASKS.values())
+        counts: dict[str, int] = {}
+        for row in rows:
+            status = str(row.get("status") or "unknown")
+            counts[status] = counts.get(status, 0) + 1
+        active_count = sum(counts.get(status, 0) for status in ("queued", "running"))
+        latest = max((str(row.get("updated_at") or row.get("created_at") or "") for row in rows), default=None)
+        return {
+            "total": len(rows),
+            "counts": counts,
+            "active_count": active_count,
+            "queue_depth": len(TASK_QUEUE),
+            "worker_started": TASK_WORKER_STARTED,
+            "latest_updated_at": latest or None,
+        }
+
+
+def system_recommendations(
+    *,
+    stale_count: int,
+    recommended_count: int,
+    files: dict[str, dict[str, Any]],
+    tasks: dict[str, Any],
+    okx_status: dict[str, Any],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if recommended_count > 0:
+        rows.append(
+            {
+                "priority": "high",
+                "area": "数据",
+                "title": "刷新建议缓存",
+                "detail": f"{recommended_count} 项缓存被标记为建议刷新。",
+                "action": "进入数据页执行后台刷新建议。",
+                "target_view": "数据",
+                "task": {"type": "data_refresh", "params": {"stale": True, "recommended_only": True}},
+            }
+        )
+    elif stale_count > 0:
+        rows.append(
+            {
+                "priority": "medium",
+                "area": "数据",
+                "title": "处理陈旧缓存",
+                "detail": f"{stale_count} 项缓存陈旧，但当前没有强制刷新建议。",
+                "action": "低峰时段分批刷新陈旧缓存。",
+                "target_view": "数据",
+                "task": {"type": "data_refresh", "params": {"stale": True, "recommended_only": False}},
+            }
+        )
+    if not okx_status.get("configured"):
+        rows.append(
+            {
+                "priority": "medium",
+                "area": "实盘",
+                "title": "配置 OKX 只读密钥",
+                "detail": "当前缺少完整 OKX API Key、Secret 或 Passphrase。",
+                "action": "进入实盘页输入只读密钥并运行诊断。",
+                "target_view": "实盘",
+            }
+        )
+    if not files.get("paper_state", {}).get("exists"):
+        rows.append(
+            {
+                "priority": "high",
+                "area": "策略",
+                "title": "初始化模拟盘状态",
+                "detail": "模拟盘状态文件缺失，状态恢复和审计会受影响。",
+                "action": "启动模拟盘或刷新工作区状态。",
+                "target_view": "策略",
+            }
+        )
+    if not files.get("execution_orders", {}).get("exists"):
+        rows.append(
+            {
+                "priority": "medium",
+                "area": "执行",
+                "title": "生成执行账本",
+                "detail": "执行账本文件缺失，无法追踪 dry-run 和重复订单意图。",
+                "action": "运行一次执行预演以初始化账本。",
+                "target_view": "实盘",
+            }
+        )
+    if int(tasks.get("active_count") or 0) > 0:
+        rows.append(
+            {
+                "priority": "info",
+                "area": "任务",
+                "title": "等待后台任务完成",
+                "detail": f"当前有 {tasks.get('active_count')} 个后台任务正在排队或运行。",
+                "action": "在数据页任务队列查看进度，必要时取消。",
+                "target_view": "数据",
+            }
+        )
+    if not rows:
+        rows.append(
+            {
+                "priority": "info",
+                "area": "系统",
+                "title": "暂无维护阻断",
+                "detail": "关键文件、任务队列和缓存检查未发现高优先级维护项。",
+                "action": "继续运行策略监控和周期性数据刷新。",
+                "target_view": "设置",
+            }
+        )
+    return rows
+
+
+def system_status() -> dict[str, Any]:
+    cache = cache_status()
+    rows = cache.get("rows", [])
+    stale_rows = [row for row in rows if row.get("is_stale")]
+    recommended_rows = [row for row in rows if row.get("recommended_refresh")]
+    okx_status = okx_credentials_status()
+    files = {
+        "task_history": path_status(TASK_HISTORY_FILE),
+        "paper_state": path_status(PAPER_STATE_FILE),
+        "paper_events": path_status(PAPER_EVENT_FILE),
+        "paper_audit": path_status(PAPER_AUDIT_FILE),
+        "execution_orders": path_status(EXECUTION_ORDER_FILE),
+        "signal_log": path_status(SIGNAL_LOG_FILE),
+    }
+    tasks = task_system_status()
+    return {
+        "ok": True,
+        "server": {
+            "started_at": SERVER_STARTED_AT,
+            "updated_at": now_iso(),
+            "root": str(ROOT),
+        },
+        "environment": {
+            "live_trading_enabled": LIVE_TRADING_ENABLED,
+            "okx_configured": bool(okx_status.get("configured")),
+            "okx_simulated": bool(okx_status.get("simulated")),
+            "okx_base_url": OKX_API_BASE_URL,
+        },
+        "cache": {
+            **cache_directory_status(),
+            "market_rows": len(rows),
+            "stale_rows": len(stale_rows),
+            "recommended_rows": len(recommended_rows),
+            "portfolio_result_cache": cache.get("portfolio_result_cache"),
+        },
+        "tasks": {
+            **tasks,
+            "history_file": files["task_history"],
+        },
+        "files": files,
+        "recommendations": system_recommendations(
+            stale_count=len(stale_rows),
+            recommended_count=len(recommended_rows),
+            files=files,
+            tasks=tasks,
+            okx_status=okx_status,
+        ),
     }
 
 
@@ -4202,8 +5884,47 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(reconcile_paper_audit(limit))
             return
 
+        if parsed.path == "/api/execution/config":
+            self.send_json(execution_config())
+            return
+
+        if parsed.path == "/api/execution/orders":
+            query = urllib.parse.parse_qs(parsed.query)
+            limit = int(query.get("limit", ["50"])[0])
+            self.send_json(read_execution_orders(limit))
+            return
+
+        if parsed.path == "/api/okx/account":
+            self.send_json(okx_account_readonly())
+            return
+
+        if parsed.path == "/api/okx/diagnostics":
+            self.send_json(okx_diagnostics())
+            return
+
+        if parsed.path == "/api/okx/instruments":
+            query = urllib.parse.parse_qs(parsed.query)
+            inst_id = query.get("instId", ["BTC-USDT-SWAP"])[0]
+            inst_type = query.get("instType", ["SWAP"])[0]
+            self.send_json(okx_instrument_rules(inst_id, inst_type))
+            return
+
+        if parsed.path == "/api/okx/positions":
+            query = urllib.parse.parse_qs(parsed.query)
+            params = {key: values[0] for key, values in query.items() if values}
+            self.send_json(okx_positions_readonly(params))
+            return
+
+        if parsed.path == "/api/execution/environment":
+            self.send_json(execution_environment_status())
+            return
+
         if parsed.path == "/api/data/status":
             self.send_json(cache_status())
+            return
+
+        if parsed.path == "/api/system/status":
+            self.send_json(system_status())
             return
 
         if parsed.path == "/api/data/refresh-progress":
@@ -4273,6 +5994,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self) -> None:
+        if self.path == "/api/okx/session-credentials":
+            try:
+                body = read_json(self)
+                result = set_okx_session_credentials(body)
+                self.send_json(result, 200 if result.get("ok") else 400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 500)
+            return
+
         if self.path == "/api/backtest":
             try:
                 body = read_json(self)
@@ -4360,7 +6090,34 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/api/readiness":
             try:
                 body = read_json(self)
-                self.send_json(readiness_gate(body))
+                result = readiness_gate(body)
+                append_paper_audit(
+                    {
+                        "action": "readiness_check",
+                        "inst_id": body.get("instId") or body.get("inst_id"),
+                        "bar": body.get("bar"),
+                        "strategy_mode": body.get("strategy_mode"),
+                        "params": audit_params(body),
+                        "readiness": compact_readiness_result(result),
+                    }
+                )
+                self.send_json(result)
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, 500)
+            return
+
+        if self.path == "/api/execution/dry-run":
+            try:
+                body = read_json(self)
+                self.send_json(execution_dry_run(body))
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, 500)
+            return
+
+        if self.path == "/api/execution/live-submit":
+            try:
+                body = read_json(self)
+                self.send_json(submit_live_order_locked(body))
             except Exception as exc:
                 self.send_json({"error": str(exc)}, 500)
             return
@@ -4401,6 +6158,14 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 body = read_json(self)
                 self.send_json(signal_scan(body))
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, 500)
+            return
+
+        if self.path == "/api/trade-window-candles":
+            try:
+                body = read_json(self)
+                self.send_json(trade_window_candles(body))
             except Exception as exc:
                 self.send_json({"error": str(exc)}, 500)
             return
@@ -4457,6 +6222,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"error": str(exc)}, 500)
             return
 
+        if self.path == "/api/tasks/clear":
+            try:
+                body = read_json(self)
+                statuses = body.get("statuses")
+                if statuses is not None and not isinstance(statuses, list):
+                    raise ValueError("statuses must be a list")
+                self.send_json(clear_tasks([str(item) for item in statuses] if statuses else None))
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, 500)
+            return
+
         if self.path == "/api/task/cancel":
             try:
                 body = read_json(self)
@@ -4467,6 +6243,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if self.path == "/api/paper/start":
             body = read_json(self)
+            params = audit_params(body)
+            startup_readiness = body.get("startup_readiness")
             with paper_lock:
                 paper_state.running = True
                 paper_state.inst_id = body.get("instId", paper_state.inst_id)
@@ -4479,7 +6257,7 @@ class Handler(BaseHTTPRequestHandler):
                 paper_state.day_trades = 0
                 paper_state.consecutive_losses = 0
                 paper_state.circuit_breaker = {}
-                paper_state.params = paper_runtime_params(body)
+                paper_state.params = paper_runtime_params(params)
                 paper_state.position = None
                 paper_state.trades = []
                 paper_state.updated_at = datetime.now(timezone.utc).isoformat()
@@ -4493,15 +6271,50 @@ class Handler(BaseHTTPRequestHandler):
                         "max_daily_trades": body.get("max_daily_trades"),
                     },
                 )
+                append_paper_audit(
+                    {
+                        "action": "start",
+                        "inst_id": paper_state.inst_id,
+                        "bar": paper_state.bar,
+                        "strategy_mode": paper_state.strategy_mode,
+                        "params": paper_runtime_params(params),
+                        "equity_before": None,
+                        "equity_after": paper_state.equity,
+                        "day_trades": paper_state.day_trades,
+                        "loss_streak": paper_state.consecutive_losses,
+                        "position_before": None,
+                        "position_after": None,
+                        "readiness": compact_readiness_result(startup_readiness) if isinstance(startup_readiness, dict) else None,
+                        "actions": [{"type": "start", "readiness_decision": startup_readiness.get("decision") if isinstance(startup_readiness, dict) else None}],
+                    }
+                )
                 save_paper_state(paper_state)
             self.send_json({"ok": True})
             return
 
         if self.path == "/api/paper/stop":
             with paper_lock:
+                position_before = dict(paper_state.position) if paper_state.position else None
+                equity_before = paper_state.equity
                 paper_state.running = False
                 paper_state.updated_at = datetime.now(timezone.utc).isoformat()
                 append_paper_event("stop", {"equity": paper_state.equity, "position": paper_state.position is not None})
+                append_paper_audit(
+                    {
+                        "action": "stop",
+                        "inst_id": paper_state.inst_id,
+                        "bar": paper_state.bar,
+                        "strategy_mode": paper_state.strategy_mode,
+                        "params": paper_runtime_params(paper_state.params),
+                        "equity_before": equity_before,
+                        "equity_after": paper_state.equity,
+                        "day_trades": paper_state.day_trades,
+                        "loss_streak": paper_state.consecutive_losses,
+                        "position_before": position_before,
+                        "position_after": paper_state.position,
+                        "actions": [{"type": "stop", "position_open": position_before is not None}],
+                    }
+                )
                 save_paper_state(paper_state)
             self.send_json({"ok": True})
             return

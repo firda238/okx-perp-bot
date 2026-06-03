@@ -8,6 +8,8 @@ export const targetStrategyParams = {
   history_hours: 2160,
   window_end_ts: 1778839200000,
   initial_equity: 10,
+  min_live_equity_usd: 10,
+  live_margin_buffer_mult: 1.2,
   risk_pct: 0.10,
   max_loss_pct_per_trade: 0.10,
   leverage: 75,
@@ -85,7 +87,7 @@ export const targetStrategyParams = {
   block_eth_longs: true,
   block_delayed_sweep_in_chaos: false,
   block_long_in_chaos: false,
-  block_breakout_against_trend: false,
+  block_breakout_against_trend: true,
   short_trend_risk_factor: 0.70,
   limit: 300,
 };
@@ -104,12 +106,37 @@ async function request(path, options = {}) {
   return payload;
 }
 
+function compactReadiness(readiness) {
+  if (!readiness) return null;
+  return {
+    decision: readiness.decision,
+    score: readiness.score,
+    risk_level: readiness.risk_level,
+    next_action: readiness.next_action,
+    monthly_return: readiness.monthly_return,
+    rolling_ratio: readiness.rolling_ratio,
+    signal_state: readiness.signal_state,
+    checks: readiness.checks,
+    monte_carlo: { summary: readiness.monte_carlo?.summary },
+    robustness: { aggregate: readiness.robustness?.aggregate },
+  };
+}
+
 export function getPaperStatus() {
   return request("/api/paper/status");
 }
 
+export function getPaperAudit(limit = 40) {
+  const query = new URLSearchParams({ limit: String(limit) });
+  return request(`/api/paper/audit?${query.toString()}`);
+}
+
 export function getDataStatus() {
   return request("/api/data/status");
+}
+
+export function getSystemStatus() {
+  return request("/api/system/status");
 }
 
 export function getDataRefreshProgress() {
@@ -142,6 +169,13 @@ export function cancelTask(id) {
   return request("/api/task/cancel", {
     method: "POST",
     body: JSON.stringify({ id }),
+  });
+}
+
+export function clearTasks(statuses = ["completed", "failed", "cancelled"]) {
+  return request("/api/tasks/clear", {
+    method: "POST",
+    body: JSON.stringify({ statuses }),
   });
 }
 
@@ -197,6 +231,94 @@ export function runJointOptimize(params = defaultStrategyParams) {
   });
 }
 
+export function runAttributionExperiments(params = defaultStrategyParams) {
+  return request("/api/attribution-experiments", {
+    method: "POST",
+    body: JSON.stringify(params),
+  });
+}
+
+export function runReadiness(params = defaultStrategyParams) {
+  const initialEquity = Number(params.initial_equity || defaultStrategyParams.initial_equity || 10);
+  const historyHours = Number(params.history_hours || defaultStrategyParams.history_hours || 2160);
+  return request("/api/readiness", {
+    method: "POST",
+    body: JSON.stringify({
+      ...params,
+      robust_window_hours: Math.min(720, historyHours),
+      robust_step_hours: 168,
+      monte_carlo_iterations: 1000,
+      monte_carlo_floor_equity: initialEquity * 0.5,
+      monte_carlo_max_loss_probability: 0.02,
+      monte_carlo_max_p95_drawdown: 0.25,
+      target_monthly_return: 0.20,
+      readiness_min_rolling_ratio: 0.65,
+    }),
+  });
+}
+
+export function runSignalScan(params = defaultStrategyParams) {
+  return request("/api/signal-scan", {
+    method: "POST",
+    body: JSON.stringify({ ...params, record_scan: true }),
+  });
+}
+
+export function getTradeWindowCandles(params = {}) {
+  return request("/api/trade-window-candles", {
+    method: "POST",
+    body: JSON.stringify(params),
+  });
+}
+
+export function runExecutionDryRun(params = defaultStrategyParams) {
+  return request("/api/execution/dry-run", {
+    method: "POST",
+    body: JSON.stringify(params),
+  });
+}
+
+export function getExecutionConfig() {
+  return request("/api/execution/config");
+}
+
+export function getExecutionOrders(limit = 40) {
+  const query = new URLSearchParams({ limit: String(limit) });
+  return request(`/api/execution/orders?${query.toString()}`);
+}
+
+export function getExecutionEnvironment() {
+  return request("/api/execution/environment");
+}
+
+export function getOkxAccount() {
+  return request("/api/okx/account");
+}
+
+export function getOkxDiagnostics() {
+  return request("/api/okx/diagnostics");
+}
+
+export function setOkxSessionCredentials(payload) {
+  return request("/api/okx/session-credentials", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function getOkxPositions(params = {}) {
+  const query = new URLSearchParams(params);
+  const suffix = query.toString() ? `?${query.toString()}` : "";
+  return request(`/api/okx/positions${suffix}`);
+}
+
+export function submitLiveOrder(payload = {}) {
+  return request("/api/execution/live-submit", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
 export function saveResearchSnapshot(params = defaultStrategyParams) {
   return request("/api/research-snapshot", {
     method: "POST",
@@ -204,10 +326,10 @@ export function saveResearchSnapshot(params = defaultStrategyParams) {
   });
 }
 
-export function startPaper(params = defaultStrategyParams) {
+export function startPaper(params = defaultStrategyParams, readiness = null) {
   return request("/api/paper/start", {
     method: "POST",
-    body: JSON.stringify(params),
+    body: JSON.stringify({ ...params, ...(readiness ? { startup_readiness: compactReadiness(readiness) } : {}) }),
   });
 }
 

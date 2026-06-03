@@ -1,11 +1,24 @@
 import { useState } from "react";
 import { trades as fallbackTrades } from "../data/mockData";
 
+export function tradeKey(trade = {}) {
+  return [
+    trade.inst_id || "-",
+    trade.entry_time || trade.time || "-",
+    trade.exit_time || trade.exit || "-",
+    trade.side || "-",
+    trade.entry || "-",
+    trade.exit_price || trade.exit || "-",
+  ].join("|");
+}
+
 function formatTrade(trade) {
   const time = trade.entry_time || "";
   const pnl = Number(trade.pnl || 0);
   const pct = Number(trade.pnl_pct || 0);
   return {
+    id: tradeKey(trade),
+    raw: trade,
     time: time.replace("T", " ").slice(0, 16) || "-",
     timeValue: Date.parse(time) || 0,
     side: trade.side === "short" ? "Short" : "Long",
@@ -69,7 +82,7 @@ function SortHeader({ label, sortKey, activeKey, direction, onSort }) {
   );
 }
 
-export default function RecentTradesTable({ trades }) {
+export default function RecentTradesTable({ trades, selectedTrade, onSelectTrade }) {
   const [showAll, setShowAll] = useState(false);
   const [symbolFilter, setSymbolFilter] = useState("all");
   const [sideFilter, setSideFilter] = useState("all");
@@ -77,6 +90,7 @@ export default function RecentTradesTable({ trades }) {
   const [sortKey, setSortKey] = useState("time");
   const [sortDir, setSortDir] = useState("desc");
   const source = trades?.length ? trades : fallbackTrades;
+  const selectedKey = selectedTrade ? tradeKey(selectedTrade) : "";
   const total = trades?.length || fallbackTrades.length;
   const visibleTotal = trades?.length && !showAll ? Math.min(8, total) : total;
   const filteredRows = normalizeTrades(trades, showAll, symbolFilter, sideFilter, pnlFilter);
@@ -191,7 +205,11 @@ export default function RecentTradesTable({ trades }) {
           </thead>
           <tbody>
             {rows.length ? rows.map((trade) => (
-              <tr key={`${trade.time}-${trade.side}`}>
+              <tr
+                key={trade.id}
+                className={trade.id === selectedKey ? "is-selected-row" : ""}
+                onClick={() => onSelectTrade?.(trade.raw)}
+              >
                 <td>{trade.time}</td>
                 <td>
                   <span className={`side-pill ${trade.side === "Long" ? "long" : "short"}`}>{trade.side}</span>

@@ -33,9 +33,64 @@ function normalizeCandles(candles) {
   }));
 }
 
-function ChartPanel({ candles, market, loading }) {
+function tradeKey(trade = {}) {
+  return [
+    trade.inst_id || "-",
+    trade.entry_time || trade.time || "-",
+    trade.exit_time || trade.exit || "-",
+    trade.side || "-",
+    trade.entry || "-",
+    trade.exit_price || trade.exit || "-",
+  ].join("|");
+}
+
+function nearestIndexByTime(rows, value) {
+  const target = Date.parse(value || "");
+  if (!Number.isFinite(target) || !rows.length) return -1;
+  let bestIndex = -1;
+  let bestDistance = Infinity;
+  rows.forEach((row, index) => {
+    const ts = Number(row.ts || Date.parse(row.time || ""));
+    const distance = Math.abs(ts - target);
+    if (Number.isFinite(ts) && distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = index;
+    }
+  });
+  return bestIndex;
+}
+
+function normalizeTradeMarkers(trades, rows, market, selectedTrade) {
+  const selectedKey = selectedTrade ? tradeKey(selectedTrade) : "";
+  const visibleStart = Number(rows[0]?.ts || Date.parse(rows[0]?.time || ""));
+  const visibleEnd = Number(rows.at(-1)?.ts || Date.parse(rows.at(-1)?.time || ""));
+  return (trades || [])
+    .filter((trade) => trade.inst_id === market.instId)
+    .map((trade) => {
+      const entryTs = Date.parse(trade.entry_time || "");
+      const exitTs = Date.parse(trade.exit_time || "");
+      const selected = tradeKey(trade) === selectedKey;
+      const inView = (
+        Number.isFinite(entryTs)
+        && Number.isFinite(exitTs)
+        && entryTs >= visibleStart
+        && entryTs <= visibleEnd
+      );
+      return inView ? {
+        trade,
+        selected,
+        entryIndex: nearestIndexByTime(rows, trade.entry_time),
+        exitIndex: nearestIndexByTime(rows, trade.exit_time),
+      } : null;
+    })
+    .filter((marker) => marker && marker.entryIndex >= 0)
+    .slice(-18);
+}
+
+function ChartPanel({ candles, market, loading, trades = [], selectedTrade = null, onSelectTrade }) {
   const [activeTool, setActiveTool] = useState("十字光标");
   const [activePeriod, setActivePeriod] = useState("1个月");
+  const [expanded, setExpanded] = useState(false);
   const rows = useMemo(() => normalizeCandles(candles), [candles]);
   const latest = rows[rows.length - 1];
   const previous = rows[rows.length - 2];
@@ -55,6 +110,8 @@ function ChartPanel({ candles, market, loading }) {
   const changePct = previous ? change / previous.close : 0;
   const yScale = (value) => padY + ((priceMax - value) / (priceMax - priceMin || 1)) * (chartHeight - padY * 2);
   const xScale = (index) => padX + (index / Math.max(rows.length - 1, 1)) * (chartWidth - padX * 2 - 74);
+  const tradeMarkers = useMemo(() => normalizeTradeMarkers(trades, rows, market, selectedTrade), [market, rows, selectedTrade, trades]);
+  const selectedMarkerVisible = selectedTrade ? tradeMarkers.some((marker) => marker.selected) : false;
 
   function linePath(values) {
     return values
@@ -66,7 +123,7 @@ function ChartPanel({ candles, market, loading }) {
   const timeTicks = rows.filter((_, index) => index % Math.max(1, Math.floor(rows.length / 6)) === 0).slice(0, 6);
 
   return (
-    <GlassCard className="chart-panel overflow-hidden">
+    <GlassCard className={`chart-panel overflow-hidden ${expanded ? "is-expanded" : ""}`}>
       <div className="chart-header">
         <div>
           <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
@@ -83,9 +140,15 @@ function ChartPanel({ candles, market, loading }) {
           <div className="mt-2 flex flex-wrap gap-x-5 gap-y-1 text-xs text-slate-400">
             <span><b className="text-electric">MA</b> 20/50/200 {fmt(ma20.at(-1), 2)} {fmt(ma50.at(-1), 2)} {fmt(ma200.at(-1), 2)}</span>
             <span><b className="text-violet">DATA</b> {market.bar} · {rows.length} candles · OKX public</span>
+            <span><b className="text-aqua">TRADES</b> {tradeMarkers.length} visible{selectedTrade ? selectedMarkerVisible ? " · selected" : " · selected outside view" : ""}</span>
           </div>
         </div>
-        <IconButton icon={Maximize2} label="全屏（待接入）" />
+        <IconButton
+          icon={Maximize2}
+          label={expanded ? "退出图表全屏" : "展开图表"}
+          onClick={() => setExpanded((value) => !value)}
+          className={expanded ? "is-active" : ""}
+        />
       </div>
 
       <div className="relative mt-4 flex">
@@ -97,7 +160,7 @@ function ChartPanel({ candles, market, loading }) {
           ))}
         </div>
 
-        <div className="chart-canvas relative min-w-0 flex-1 rounded-[24px] border border-white/10 bg-[#06101f]/70 p-3 shadow-inner">
+        <div className="chart-canvas relative min-w-0 flex-1 rounded-[24px] border border-white/10 p-3 shadow-inner">
           <svg viewBox={`0 0 ${chartWidth} ${chartHeight}`} className="h-[460px] w-full overflow-visible">
             <defs>
               <linearGradient id="volumeGradient" x1="0" x2="0" y1="0" y2="1">
@@ -108,11 +171,11 @@ function ChartPanel({ candles, market, loading }) {
 
             {Array.from({ length: 9 }).map((_, i) => {
               const y = 34 + i * 42;
-              return <line key={`h-${i}`} x1={padX} x2={chartWidth - 78} y1={y} y2={y} stroke="rgba(180,210,255,.08)" />;
+              return <line key={`h-${i}`} className="chart-grid-line" x1={padX} x2={chartWidth - 78} y1={y} y2={y} />;
             })}
             {Array.from({ length: 12 }).map((_, i) => {
               const x = padX + i * 66;
-              return <line key={`v-${i}`} x1={x} x2={x} y1={padY} y2={chartHeight - 44} stroke="rgba(180,210,255,.055)" />;
+              return <line key={`v-${i}`} className="chart-grid-line is-minor" x1={x} x2={x} y1={padY} y2={chartHeight - 44} />;
             })}
 
             <path d={linePath(ma20)} fill="none" stroke="#2f80ff" strokeWidth="2.4" opacity=".95" />
@@ -136,12 +199,34 @@ function ChartPanel({ candles, market, loading }) {
               );
             })}
 
+            {tradeMarkers.map(({ trade, selected, entryIndex, exitIndex }) => {
+              const entryX = xScale(entryIndex);
+              const exitX = exitIndex >= 0 ? xScale(exitIndex) : entryX;
+              const entryY = yScale(Number(trade.entry || 0));
+              const exitY = yScale(Number(trade.exit_price ?? trade.exit ?? trade.entry ?? 0));
+              const positive = Number(trade.pnl || 0) >= 0;
+              const markerColor = selected ? "#f8fafc" : positive ? "#21e6b5" : "#ff4d6d";
+              return (
+                <g
+                  key={tradeKey(trade)}
+                  className={`trade-marker ${selected ? "is-selected" : ""}`}
+                  onClick={() => onSelectTrade?.(trade)}
+                >
+                  <line x1={entryX} x2={exitX} y1={entryY} y2={exitY} stroke={markerColor} strokeWidth={selected ? "2.4" : "1.6"} strokeDasharray={selected ? "0" : "4 5"} opacity={selected ? ".95" : ".55"} />
+                  <circle cx={entryX} cy={entryY} r={selected ? "7" : "5"} fill="#0b0f18" stroke={markerColor} strokeWidth="2" />
+                  <text x={entryX} y={entryY + 4} textAnchor="middle" fill={markerColor} fontSize="9" fontWeight="900">E</text>
+                  <circle cx={exitX} cy={exitY} r={selected ? "7" : "5"} fill="#0b0f18" stroke={markerColor} strokeWidth="2" />
+                  <text x={exitX} y={exitY + 4} textAnchor="middle" fill={markerColor} fontSize="9" fontWeight="900">X</text>
+                </g>
+              );
+            })}
+
             {priceTicks.map((tick) => (
-              <text key={tick} x={chartWidth - 65} y={yScale(tick) + 4} fill="rgba(226,232,240,.62)" fontSize="12">{fmt(tick, 2)}</text>
+              <text key={tick} className="chart-axis-label" x={chartWidth - 65} y={yScale(tick) + 4} fontSize="12">{fmt(tick, 2)}</text>
             ))}
 
             {timeTicks.map((tick, i) => (
-              <text key={tick.ts || tick.time} x={padX + i * 130} y={chartHeight - 12} fill="rgba(226,232,240,.52)" fontSize="12">{tick.time?.slice(11, 16) || "-"}</text>
+              <text key={tick.ts || tick.time} className="chart-axis-label" x={padX + i * 130} y={chartHeight - 12} fontSize="12">{tick.time?.slice(11, 16) || "-"}</text>
             ))}
 
             {latest ? (

@@ -160,7 +160,7 @@ function settings() {
     block_eth_longs: $("blockEthLongs").checked,
     block_delayed_sweep_in_chaos: false,
     block_long_in_chaos: false,
-    block_breakout_against_trend: false,
+    block_breakout_against_trend: $("blockBreakoutAgainstTrend").checked,
     limit: 300,
   };
 }
@@ -208,6 +208,7 @@ function applyDailyMode() {
   $("enableBreakoutGuard").checked = false;
   $("breakoutGuardWindow").value = "6";
   $("breakoutGuardRiskMultiplier").value = "0.55";
+  $("blockBreakoutAgainstTrend").checked = false;
   $("atrStopMult").value = "1.8";
   $("takeProfitRr").value = "2.8";
   $("useMultiTakeProfit").checked = false;
@@ -248,6 +249,7 @@ function applyTargetMode() {
   $("enableBreakoutGuard").checked = true;
   $("breakoutGuardWindow").value = "8";
   $("breakoutGuardRiskMultiplier").value = "0.70";
+  $("blockBreakoutAgainstTrend").checked = true;
   $("atrStopMult").value = "1.9";
   $("takeProfitRr").value = "3.0";
   $("useMultiTakeProfit").checked = false;
@@ -655,6 +657,11 @@ function renderAttributionExperiments(result) {
         <td>${row.name}</td>
         <td>${fmtNum(row.params?.short_trend_risk_factor, 2)}</td>
         <td>${fmtNum(row.params?.breakout_risk_factor, 2)}</td>
+        <td>${row.params?.block_breakout_against_trend ? "开启" : "关闭"}</td>
+        <td>${fmtPct(row.params?.risk_pct)}</td>
+        <td>${fmtNum(row.params?.min_signal_score, 2)}</td>
+        <td>${row.params?.loss_streak_pause_bars ?? "-"}</td>
+        <td>${row.params?.time_exit_bars ? `${row.params.time_exit_bars}K/${fmtNum(row.params.time_exit_min_rr, 2)}R` : "-"}</td>
         <td>${row.score === null || row.score === undefined ? "-" : fmtNum(row.score, 3)}</td>
         <td>${s.final_equity === undefined ? "-" : fmtMoney(s.final_equity)}</td>
         <td class="${(s.return_pct || 0) >= 0 ? "pnl-positive" : "pnl-negative"}">${s.return_pct === undefined ? "-" : fmtPct(s.return_pct)}</td>
