@@ -1,5 +1,5 @@
 import { lazy, Suspense, useCallback, useEffect, useState } from "react";
-import { cancelTask, clearTasks, compactDataCache, defaultStrategyParams, enqueueTask, getCandles, getDataRefreshProgress, getDataStatus, getExecutionConfig, getExecutionEnvironment, getExecutionOrders, getLatestResearchSnapshot, getOkxAccount, getOkxDiagnostics, getOkxPositions, getPaperAudit, getPaperStatus, getResearchSnapshot, getResearchSnapshots, getSystemStatus, getTasks, getTradeWindowCandles, refreshDataCache, refreshStaleDataCache, runExecutionDryRun, runPortfolioBacktest, runReadiness, runSignalScan, saveResearchSnapshot, setOkxSessionCredentials, startPaper, stopPaper, submitLiveOrder } from "./api";
+import { cancelTask, clearTasks, compactDataCache, defaultStrategyParams, enqueueTask, getAi4TradeStatus, getAutomationReadinessSnapshots, getAutomationStatus, getCandles, getDataRefreshProgress, getDataStatus, getExecutionConfig, getExecutionEnvironment, getExecutionOrders, getLatestResearchSnapshot, getOkxAccount, getOkxDiagnostics, getOkxPositions, getPaperAudit, getPaperEquityHistory, getPaperStatus, getResearchSnapshot, getResearchSnapshots, getSystemStatus, getTasks, getTradeWindowCandles, recordExecutionOrderAction, refreshDataCache, refreshStaleDataCache, runAutomationPreflight, runExecutionDryRun, runPortfolioBacktest, runReadiness, runSignalScan, saveResearchSnapshot, setOkxSessionCredentials, startPaper, stopPaper, submitLiveOrder } from "./api";
 import ChartPanel from "./components/ChartPanel";
 import Sidebar from "./components/Sidebar";
 import StrategyControlPanel from "./components/StrategyControlPanel";
@@ -7,6 +7,7 @@ import TopBar from "./components/TopBar";
 import { DashboardView, DataView, LiveView, MarketView, RiskView, SettingsView } from "./components/WorkspaceViews";
 
 const BacktestPanel = lazy(() => import("./components/BacktestPanel"));
+const DASHBOARD_REFRESH_MS = 15 * 60 * 1000;
 
 function readStoredPreference(key, fallback) {
   if (typeof window === "undefined") return fallback;
@@ -21,6 +22,7 @@ export default function App() {
   const [running, setRunning] = useState(true);
   const [paperState, setPaperState] = useState(null);
   const [paperAudit, setPaperAudit] = useState(null);
+  const [paperEquityHistory, setPaperEquityHistory] = useState(null);
   const [portfolio, setPortfolio] = useState(null);
   const [optimization, setOptimization] = useState(null);
   const [riskExperiments, setRiskExperiments] = useState(null);
@@ -31,6 +33,9 @@ export default function App() {
   const [executionConfig, setExecutionConfig] = useState(null);
   const [executionEnvironment, setExecutionEnvironment] = useState(null);
   const [executionOrders, setExecutionOrders] = useState(null);
+  const [automationStatus, setAutomationStatus] = useState(null);
+  const [readinessSnapshots, setReadinessSnapshots] = useState(null);
+  const [ai4tradeStatus, setAi4tradeStatus] = useState(null);
   const [okxAccount, setOkxAccount] = useState(null);
   const [okxDiagnostics, setOkxDiagnostics] = useState(null);
   const [okxPositions, setOkxPositions] = useState(null);
@@ -53,12 +58,12 @@ export default function App() {
   const [appliedTaskResults, setAppliedTaskResults] = useState({});
   const [researchSnapshots, setResearchSnapshots] = useState(null);
   const [selectedResearchSnapshot, setSelectedResearchSnapshot] = useState(null);
-  const [activeView, setActiveView] = useState("策略");
+  const [activeView, setActiveView] = useState("仪表盘");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => readStoredPreference("quant-sidebar-collapsed", "false") === "true");
   const [theme, setTheme] = useState(() => readStoredPreference("quant-theme", "dark"));
   const [market, setMarket] = useState({ instId: defaultStrategyParams.instId, bar: defaultStrategyParams.bar });
   const [strategyConfig, setStrategyConfig] = useState(defaultStrategyParams);
-  const [loading, setLoading] = useState({ paper: true, audit: true, executionConfig: true, executionEnvironment: true, executionOrders: true, okx: true, okxDiagnostics: true, okxCredentials: false, preflight: false, portfolio: true, candles: true, tradeWindow: false, optimize: false, riskExperiments: false, readiness: false, signalScan: false, execution: false, liveSubmit: false, action: false, snapshot: false, snapshotInspect: false, dataRefresh: false, dataCompact: false, tasks: false, systemStatus: false });
+  const [loading, setLoading] = useState({ paper: true, audit: true, equityHistory: true, executionConfig: true, executionEnvironment: true, executionOrders: true, automation: true, ai4trade: true, okx: true, okxDiagnostics: true, okxCredentials: false, preflight: false, portfolio: true, candles: true, tradeWindow: false, optimize: false, riskExperiments: false, readiness: false, signalScan: false, execution: false, liveSubmit: false, action: false, snapshot: false, snapshotInspect: false, dataRefresh: false, dataCompact: false, tasks: false, systemStatus: false });
   const [error, setError] = useState("");
 
   const runParams = useCallback(
@@ -140,6 +145,19 @@ export default function App() {
     }
   }, []);
 
+  const refreshPaperEquityHistory = useCallback(async () => {
+    setLoading((state) => ({ ...state, equityHistory: true }));
+    try {
+      const result = await getPaperEquityHistory({ limit: 2000 });
+      setPaperEquityHistory(result);
+      setError("");
+    } catch (err) {
+      setError(`权益历史读取失败：${err.message}`);
+    } finally {
+      setLoading((state) => ({ ...state, equityHistory: false }));
+    }
+  }, []);
+
   const refreshExecutionConfig = useCallback(async () => {
     setLoading((state) => ({ ...state, executionConfig: true }));
     try {
@@ -179,6 +197,59 @@ export default function App() {
     }
   }, []);
 
+  const refreshAutomationStatus = useCallback(async () => {
+    setLoading((state) => ({ ...state, automation: true }));
+    try {
+      const result = await getAutomationStatus();
+      setAutomationStatus(result);
+      setError("");
+    } catch (err) {
+      setError(`自动化自检读取失败：${err.message}`);
+    } finally {
+      setLoading((state) => ({ ...state, automation: false }));
+    }
+  }, []);
+
+  const refreshReadinessSnapshots = useCallback(async () => {
+    try {
+      const result = await getAutomationReadinessSnapshots(30);
+      setReadinessSnapshots(result);
+      setError("");
+    } catch (err) {
+      setError(`Readiness快照读取失败：${err.message}`);
+    }
+  }, []);
+
+  const runAutomationCheck = useCallback(async () => {
+    setLoading((state) => ({ ...state, automation: true, preflight: true }));
+    try {
+      const result = await runAutomationPreflight(runParams());
+      if (result?.automation) setAutomationStatus(result.automation);
+      if (result?.dry_run) setExecutionPlan(result.dry_run);
+      await Promise.all([refreshPaperAudit(), refreshPaperEquityHistory(), refreshExecutionOrders(), refreshExecutionConfig(), refreshExecutionEnvironment(), refreshReadinessSnapshots()]);
+      setError("");
+      return result;
+    } catch (err) {
+      setError(`自动化自检失败：${err.message}`);
+      throw err;
+    } finally {
+      setLoading((state) => ({ ...state, automation: false, preflight: false }));
+    }
+  }, [refreshExecutionConfig, refreshExecutionEnvironment, refreshExecutionOrders, refreshPaperAudit, refreshPaperEquityHistory, refreshReadinessSnapshots, runParams]);
+
+  const refreshAi4TradeStatus = useCallback(async () => {
+    setLoading((state) => ({ ...state, ai4trade: true }));
+    try {
+      const result = await getAi4TradeStatus();
+      setAi4tradeStatus(result);
+      setError("");
+    } catch (err) {
+      setError(`AI4Trade 只读状态读取失败：${err.message}`);
+    } finally {
+      setLoading((state) => ({ ...state, ai4trade: false }));
+    }
+  }, []);
+
   const refreshOkxReadonly = useCallback(async () => {
     setLoading((state) => ({ ...state, okx: true }));
     try {
@@ -209,16 +280,25 @@ export default function App() {
   const saveOkxSessionCredentials = useCallback(async (payload) => {
     setLoading((state) => ({ ...state, okxCredentials: true }));
     try {
-      await setOkxSessionCredentials(payload);
-      await Promise.all([refreshExecutionConfig(), refreshExecutionEnvironment(), refreshOkxReadonly(), runOkxDiagnostics()]);
+      const result = await setOkxSessionCredentials(payload);
+      await Promise.all([
+        refreshExecutionConfig(),
+        refreshExecutionEnvironment(),
+        refreshOkxReadonly(),
+        runOkxDiagnostics(),
+        refreshAutomationStatus(),
+        refreshReadinessSnapshots(),
+        refreshPaperEquityHistory(),
+      ]);
       setError("");
+      return result;
     } catch (err) {
       setError(`OKX 密钥配置失败：${err.message}`);
       throw err;
     } finally {
       setLoading((state) => ({ ...state, okxCredentials: false }));
     }
-  }, [refreshExecutionConfig, refreshExecutionEnvironment, refreshOkxReadonly, runOkxDiagnostics]);
+  }, [refreshAutomationStatus, refreshExecutionConfig, refreshExecutionEnvironment, refreshOkxReadonly, refreshPaperEquityHistory, refreshReadinessSnapshots, runOkxDiagnostics]);
 
   const refreshPortfolio = useCallback(async () => {
     setLoading((state) => ({ ...state, portfolio: true }));
@@ -395,14 +475,14 @@ export default function App() {
       const result = await runExecutionDryRun(runParams());
       setExecutionPlan(result);
       setLiveSubmitResult(null);
-      await Promise.all([refreshPaperAudit(), refreshExecutionOrders(), refreshOkxReadonly(), refreshExecutionEnvironment(), runOkxDiagnostics()]);
+      await Promise.all([refreshPaperAudit(), refreshPaperEquityHistory(), refreshExecutionOrders(), refreshAutomationStatus(), refreshReadinessSnapshots(), refreshOkxReadonly(), refreshExecutionEnvironment(), runOkxDiagnostics()]);
       setError("");
     } catch (err) {
       setError(`执行 dry-run 失败：${err.message}`);
     } finally {
       setLoading((state) => ({ ...state, execution: false }));
     }
-  }, [refreshExecutionEnvironment, refreshExecutionOrders, refreshOkxReadonly, refreshPaperAudit, runOkxDiagnostics, runParams]);
+  }, [refreshAutomationStatus, refreshExecutionEnvironment, refreshExecutionOrders, refreshOkxReadonly, refreshPaperAudit, refreshPaperEquityHistory, refreshReadinessSnapshots, runOkxDiagnostics, runParams]);
 
   const runLivePreflight = useCallback(async () => {
     const startedAt = new Date().toISOString();
@@ -451,6 +531,7 @@ export default function App() {
       const [audit, orders] = await Promise.all([getPaperAudit(60), getExecutionOrders(60)]);
       setPaperAudit(audit);
       setExecutionOrders(orders);
+      await Promise.all([refreshAutomationStatus(), refreshReadinessSnapshots()]);
       setStep("ledger", { status: "pass", detail: "审计和账本已更新" });
       setError("");
     } catch (err) {
@@ -459,9 +540,9 @@ export default function App() {
     } finally {
       setLoading((state) => ({ ...state, preflight: false }));
     }
-  }, [runParams]);
+  }, [refreshAutomationStatus, refreshReadinessSnapshots, runParams]);
 
-  const runLiveSubmitLockTest = useCallback(async (confirmation = "") => {
+  const runLiveSubmitLockTest = useCallback(async (confirmation = "", options = {}) => {
     setLoading((state) => ({ ...state, liveSubmit: true }));
     try {
       const result = await submitLiveOrder({
@@ -470,16 +551,31 @@ export default function App() {
         guard: executionPlan?.guard || null,
         data_quality: executionPlan?.data_quality || null,
         confirmation,
+        use_canary: Boolean(options.use_canary),
       });
       setLiveSubmitResult(result);
-      await Promise.all([refreshPaperAudit(), refreshExecutionConfig(), refreshExecutionOrders()]);
+      await Promise.all([refreshPaperAudit(), refreshPaperEquityHistory(), refreshExecutionConfig(), refreshExecutionOrders(), refreshAutomationStatus(), refreshReadinessSnapshots()]);
       setError("");
     } catch (err) {
       setError(`实盘提交锁测试失败：${err.message}`);
     } finally {
       setLoading((state) => ({ ...state, liveSubmit: false }));
     }
-  }, [executionPlan, refreshExecutionConfig, refreshExecutionOrders, refreshPaperAudit, runParams]);
+  }, [executionPlan, refreshAutomationStatus, refreshExecutionConfig, refreshExecutionOrders, refreshPaperAudit, refreshPaperEquityHistory, refreshReadinessSnapshots, runParams]);
+
+  const recordExecutionAction = useCallback(async (action, source, options = {}) => {
+    if (!action || !source) return;
+    setLoading((state) => ({ ...state, liveSubmit: true }));
+    try {
+      await recordExecutionOrderAction({ action, source, ...options });
+      await Promise.all([refreshExecutionOrders(), refreshSystemStatus(), refreshPaperAudit()]);
+      setError("");
+    } catch (err) {
+      setError(`执行账本处置记录失败：${err.message}`);
+    } finally {
+      setLoading((state) => ({ ...state, liveSubmit: false }));
+    }
+  }, [refreshExecutionOrders, refreshPaperAudit, refreshSystemStatus]);
 
   const refreshWorkspaceStatus = useCallback(async () => {
     setLoading((state) => ({ ...state, action: true }));
@@ -487,9 +583,13 @@ export default function App() {
       await Promise.all([
         refreshPaper(),
         refreshPaperAudit(),
+        refreshPaperEquityHistory(),
         refreshExecutionConfig(),
         refreshExecutionEnvironment(),
         refreshExecutionOrders(),
+        refreshAutomationStatus(),
+        refreshReadinessSnapshots(),
+        refreshAi4TradeStatus(),
         refreshOkxReadonly(),
         runOkxDiagnostics(),
         refreshDataStatus(),
@@ -501,7 +601,7 @@ export default function App() {
     } finally {
       setLoading((state) => ({ ...state, action: false }));
     }
-  }, [refreshDataStatus, refreshExecutionConfig, refreshExecutionEnvironment, refreshExecutionOrders, refreshOkxReadonly, refreshPaper, refreshPaperAudit, refreshSystemStatus, runOkxDiagnostics]);
+  }, [refreshAi4TradeStatus, refreshAutomationStatus, refreshDataStatus, refreshExecutionConfig, refreshExecutionEnvironment, refreshExecutionOrders, refreshOkxReadonly, refreshPaper, refreshPaperAudit, refreshPaperEquityHistory, refreshReadinessSnapshots, refreshSystemStatus, runOkxDiagnostics]);
 
   const applyCandidate = useCallback(async (candidate) => {
     const nextConfig = { ...strategyConfig, ...(candidate?.params || {}) };
@@ -535,15 +635,19 @@ export default function App() {
   useEffect(() => {
     refreshPaper();
     refreshPaperAudit();
+    refreshPaperEquityHistory();
     refreshExecutionConfig();
     refreshExecutionEnvironment();
     refreshExecutionOrders();
+    refreshAutomationStatus();
+    refreshReadinessSnapshots();
+    refreshAi4TradeStatus();
     refreshOkxReadonly();
     runOkxDiagnostics();
     refreshDataStatus();
     refreshSystemStatus();
     refreshTasks();
-  }, [refreshDataStatus, refreshExecutionConfig, refreshExecutionEnvironment, refreshExecutionOrders, refreshOkxReadonly, refreshPaper, refreshPaperAudit, refreshSystemStatus, refreshTasks, runOkxDiagnostics]);
+  }, [refreshAi4TradeStatus, refreshAutomationStatus, refreshDataStatus, refreshExecutionConfig, refreshExecutionEnvironment, refreshExecutionOrders, refreshOkxReadonly, refreshPaper, refreshPaperAudit, refreshPaperEquityHistory, refreshReadinessSnapshots, refreshSystemStatus, refreshTasks, runOkxDiagnostics]);
 
   useEffect(() => {
     window.localStorage.setItem("quant-theme", theme);
@@ -562,6 +666,21 @@ export default function App() {
       refreshSystemStatus();
     }
   }, [activeView, refreshDataStatus, refreshSystemStatus, refreshTasks]);
+
+  useEffect(() => {
+    if (activeView !== "仪表盘") return undefined;
+    const timer = window.setInterval(() => {
+      refreshPaper();
+      refreshPaperAudit();
+      refreshPaperEquityHistory();
+      refreshExecutionConfig();
+      refreshExecutionEnvironment();
+      refreshAutomationStatus();
+      refreshReadinessSnapshots();
+      refreshSystemStatus();
+    }, DASHBOARD_REFRESH_MS);
+    return () => window.clearInterval(timer);
+  }, [activeView, refreshAutomationStatus, refreshExecutionConfig, refreshExecutionEnvironment, refreshPaper, refreshPaperAudit, refreshPaperEquityHistory, refreshReadinessSnapshots, refreshSystemStatus]);
 
   useEffect(() => {
     const hasActiveTask = tasks.some((task) => ["queued", "running"].includes(task.status));
@@ -737,7 +856,7 @@ export default function App() {
     }
   }, []);
 
-  const refreshDataCacheRows = useCallback(async (row = null, recommendedOnly = false) => {
+  const refreshDataCacheRows = useCallback(async (row = null, recommendedOnly = false, includeHighCost = false) => {
     setLoading((state) => ({ ...state, dataRefresh: true }));
     setDataRefreshProgress(null);
     try {
@@ -746,7 +865,7 @@ export default function App() {
         setDataRefreshResult(result);
         setDataRefreshProgress(result.progress || null);
       } else {
-        const result = await refreshStaleDataCache(dataRefreshBatchSize, recommendedOnly);
+        const result = await refreshStaleDataCache(dataRefreshBatchSize, recommendedOnly, includeHighCost);
         setDataRefreshResult(result);
         setDataRefreshProgress(result.progress || null);
       }
@@ -853,6 +972,7 @@ export default function App() {
       }
       await refreshPaper();
       await refreshPaperAudit();
+      await refreshPaperEquityHistory();
       setError("");
     } catch (err) {
       setError(`模拟盘切换失败：${err.message}`);
@@ -871,8 +991,6 @@ export default function App() {
 
   return (
     <div className={`app-shell theme-${theme} ${sidebarCollapsed ? "is-sidebar-collapsed" : ""}`}>
-      <div className="bg-orb bg-orb-a" />
-      <div className="bg-orb bg-orb-b" />
       <div className="bg-grid" />
 
       <Sidebar
@@ -893,11 +1011,13 @@ export default function App() {
           market={market}
           okxAccount={executionEnvironment?.okx_account || okxAccount}
           executionConfig={executionConfig}
+          systemStatus={systemStatus}
           onMarketChange={updateMarket}
           onRefresh={() => {
             refreshPortfolio();
             refreshCandles();
             refreshDataStatus();
+            refreshSystemStatus();
           }}
           onOpenLive={() => setActiveView("实盘")}
           onOpenView={setActiveView}
@@ -976,10 +1096,13 @@ export default function App() {
                 executionPlan={executionPlan}
                 executionConfig={executionConfig}
                 executionEnvironment={executionEnvironment}
+                automationStatus={automationStatus}
+                systemStatus={systemStatus}
                 okxDiagnostics={okxDiagnostics}
                 dataStatus={dataStatus}
                 paperAudit={paperAudit}
-                refreshAllLoading={loading.paper || loading.portfolio || loading.candles || loading.dataRefresh}
+                paperEquityHistory={paperEquityHistory}
+                refreshAllLoading={loading.paper || loading.equityHistory || loading.portfolio || loading.candles || loading.dataRefresh || loading.automation || loading.systemStatus}
                 signalScanLoading={loading.signalScan}
                 preflightLoading={loading.preflight}
                 onRefreshAll={() => {
@@ -988,11 +1111,15 @@ export default function App() {
                   refreshDataStatus();
                   refreshPaper();
                   refreshPaperAudit();
+                  refreshPaperEquityHistory();
                   refreshExecutionConfig();
                   refreshExecutionEnvironment();
+                  refreshAutomationStatus();
+                  refreshSystemStatus();
                 }}
                 onOpenView={setActiveView}
                 onRunSignalScan={runManualSignalScan}
+                onRunAutomationCheck={runAutomationCheck}
                 onRunLivePreflight={runLivePreflight}
               />
             ) : null}
@@ -1060,6 +1187,9 @@ export default function App() {
                 executionConfig={executionConfig}
                 executionEnvironment={executionEnvironment}
                 executionOrders={executionOrders}
+                ai4tradeStatus={ai4tradeStatus}
+                automationStatus={automationStatus}
+                readinessSnapshots={readinessSnapshots}
                 okxAccount={okxAccount}
                 okxDiagnostics={okxDiagnostics}
                 okxPositions={okxPositions}
@@ -1068,6 +1198,7 @@ export default function App() {
                 executionConfigLoading={loading.executionConfig}
                 executionEnvironmentLoading={loading.executionEnvironment}
                 executionOrdersLoading={loading.executionOrders}
+                ai4tradeLoading={loading.ai4trade}
                 okxLoading={loading.okx}
                 okxDiagnosticsLoading={loading.okxDiagnostics}
                 okxCredentialsLoading={loading.okxCredentials}
@@ -1077,6 +1208,8 @@ export default function App() {
                 liveRiskConfig={{
                   min_live_equity_usd: strategyConfig.min_live_equity_usd,
                   live_margin_buffer_mult: strategyConfig.live_margin_buffer_mult,
+                  max_live_order_notional_usd: strategyConfig.max_live_order_notional_usd,
+                  canary_order_notional_usd: strategyConfig.canary_order_notional_usd,
                 }}
                 paperState={paperState}
                 paperAudit={paperAudit}
@@ -1085,11 +1218,13 @@ export default function App() {
                 onRefreshExecutionConfig={refreshExecutionConfig}
                 onRefreshExecutionEnvironment={refreshExecutionEnvironment}
                 onRefreshExecutionOrders={refreshExecutionOrders}
+                onRefreshAi4TradeStatus={refreshAi4TradeStatus}
                 onRefreshOkxReadonly={refreshOkxReadonly}
                 onRunOkxDiagnostics={runOkxDiagnostics}
                 onSaveOkxSessionCredentials={saveOkxSessionCredentials}
                 onRunLivePreflight={runLivePreflight}
                 onRunLiveSubmitLockTest={runLiveSubmitLockTest}
+                onRecordExecutionAction={recordExecutionAction}
               />
             ) : null}
             {activeView === "设置" ? (
@@ -1099,6 +1234,8 @@ export default function App() {
                 liveRiskConfig={{
                   min_live_equity_usd: strategyConfig.min_live_equity_usd,
                   live_margin_buffer_mult: strategyConfig.live_margin_buffer_mult,
+                  max_live_order_notional_usd: strategyConfig.max_live_order_notional_usd,
+                  canary_order_notional_usd: strategyConfig.canary_order_notional_usd,
                 }}
                 executionConfig={executionConfig}
                 executionEnvironment={executionEnvironment}

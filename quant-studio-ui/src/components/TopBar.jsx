@@ -11,13 +11,15 @@ function money(value) {
   return Number(value).toLocaleString(undefined, { maximumFractionDigits: 4 });
 }
 
-export default function TopBar({ running, apiError, loading, market, okxAccount, executionConfig, onMarketChange, onRefresh, onOpenLive, onOpenView }) {
+export default function TopBar({ running, apiError, loading, market, okxAccount, executionConfig, systemStatus, onMarketChange, onRefresh, onOpenLive, onOpenView }) {
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
   const searchInputRef = useRef(null);
   const okxReady = Boolean(okxAccount?.ok);
   const keyReady = Boolean(executionConfig?.okx_configured);
+  const connectorStatus = executionConfig?.connector_status || {};
+  const liveLocked = Boolean(connectorStatus.dry_run_only) && !connectorStatus.can_submit_live;
   const accountTitle = okxReady
     ? `OKX只读已连接 · 权益 ${money(okxAccount?.total_equity_usd)}U`
     : keyReady
@@ -25,6 +27,17 @@ export default function TopBar({ running, apiError, loading, market, okxAccount,
       : "OKX密钥未配置";
   const notifications = useMemo(() => {
     const rows = [];
+    const systemRows = (systemStatus?.recommendations || [])
+      .filter((row) => ["high", "medium"].includes(row.priority))
+      .slice(0, 2)
+      .map((row) => ({
+        tone: row.priority === "high" ? "risk" : "warn",
+        title: row.title || "系统维护建议",
+        detail: row.detail || row.action || "查看系统证据。",
+        action: row.action || `打开${row.target_view || row.area || "设置"}`,
+        target: row.target_view || row.area || "设置",
+      }));
+    rows.push(...systemRows);
     if (apiError) {
       rows.push({ tone: "risk", title: "API 需要处理", detail: apiError, action: "打开设置", target: "设置" });
     }
@@ -41,8 +54,8 @@ export default function TopBar({ running, apiError, loading, market, okxAccount,
     } else {
       rows.push({ tone: "risk", title: "策略已停止", detail: "模拟盘未运行，信号不会自动推进。", action: "打开策略", target: "策略" });
     }
-    return rows.slice(0, 4);
-  }, [apiError, keyReady, loading, market.bar, market.instId, okxReady, running]);
+    return rows.slice(0, 5);
+  }, [apiError, keyReady, loading, market.bar, market.instId, okxReady, running, systemStatus]);
   const attentionCount = notifications.filter((item) => item.tone === "risk" || item.tone === "warn").length;
   const searchResults = useMemo(() => {
     const query = searchTerm.trim().toLowerCase();
@@ -135,6 +148,14 @@ export default function TopBar({ running, apiError, loading, market, okxAccount,
           <span className="pulse-dot" />
           <span>{apiError ? "API Attention" : loading ? "Syncing Data" : running ? "Strategy Running" : "Strategy Stopped"}</span>
         </div>
+        <div className="topbar-guard-strip hidden xl:flex">
+          <button type="button" className={`guard-chip ${liveLocked ? "is-safe" : "is-risk"}`} onClick={() => onOpenLive?.()}>
+            {liveLocked ? "实盘锁定" : "实盘异常"}
+          </button>
+          <button type="button" className={`guard-chip ${okxReady ? "is-safe" : keyReady ? "is-warn" : "is-muted"}`} onClick={() => onOpenLive?.()}>
+            {okxReady ? "OKX只读通过" : keyReady ? "OKX待诊断" : "OKX未配置"}
+          </button>
+        </div>
 
         <label className="search-box hidden min-w-[190px] max-w-[420px] flex-1 sm:flex">
           <Search size={17} className="text-slate-400" />
@@ -189,6 +210,10 @@ export default function TopBar({ running, apiError, loading, market, okxAccount,
               <div className="notification-header">
                 <strong>通知中心</strong>
                 <span>{attentionCount ? `${attentionCount} 项待处理` : "状态正常"}</span>
+              </div>
+              <div className="notification-system-summary">
+                <strong>系统建议</strong>
+                <span>{systemStatus?.recommendations?.length ? `${systemStatus.recommendations.length} 条` : "等待同步"}</span>
               </div>
               <div className="notification-list">
                 {notifications.map((item) => (

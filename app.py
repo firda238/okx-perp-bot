@@ -10,6 +10,7 @@ import os
 import random
 import re
 import socket
+import subprocess
 import threading
 import time
 import urllib.request
@@ -55,20 +56,70 @@ SIGNAL_LOG_FILE = CACHE_DIR / "signal-scans.jsonl"
 PAPER_STATE_FILE = CACHE_DIR / "paper-state.json"
 PAPER_EVENT_FILE = CACHE_DIR / "paper-events.jsonl"
 PAPER_AUDIT_FILE = CACHE_DIR / "paper-audit.jsonl"
+PAPER_EQUITY_FILE = CACHE_DIR / "paper-equity.jsonl"
+ACCOUNT_EQUITY_FILE = CACHE_DIR / "account-equity.jsonl"
 EXECUTION_ORDER_FILE = CACHE_DIR / "execution-orders.jsonl"
+AUTOMATION_STATE_FILE = CACHE_DIR / "automation-state.json"
+AUTOMATION_PREFLIGHT_FILE = CACHE_DIR / "automation-preflight.jsonl"
+AUTOMATION_HEARTBEAT_FILE = CACHE_DIR / "automation-heartbeat.jsonl"
+AUTOMATION_EVENT_FILE = CACHE_DIR / "automation-events.jsonl"
+AUTOMATION_TASK_ACTION_FILE = CACHE_DIR / "automation-task-actions.jsonl"
+READINESS_SNAPSHOT_FILE = CACHE_DIR / "launchd" / "readiness-snapshots.jsonl"
+LAUNCHD_EVIDENCE_DIR = CACHE_DIR / "launchd" / "evidence"
+OKX_DIAGNOSTICS_FILE = CACHE_DIR / "okx-diagnostics.jsonl"
+AI4TRADE_HISTORY_FILE = CACHE_DIR / "ai4trade-history.jsonl"
 TASK_HISTORY_FILE = CACHE_DIR / "task-history.json"
 LIVE_TRADING_ENABLED = os.environ.get("LIVE_TRADING_ENABLED", "").lower() in {"1", "true", "yes", "on"}
+OKX_LIVE_ORDER_ENABLED = os.environ.get("OKX_LIVE_ORDER_ENABLED", "").lower() in {"1", "true", "yes", "on"}
+OKX_LIVE_CANCEL_ENABLED = os.environ.get("OKX_LIVE_CANCEL_ENABLED", "").lower() in {"1", "true", "yes", "on"}
 SERVER_STARTED_AT = datetime.now(timezone.utc).isoformat()
+ACCOUNT_EQUITY_ANCHOR_DATE = os.environ.get("ACCOUNT_EQUITY_ANCHOR_DATE", "2026-06-06")
+ACCOUNT_EQUITY_INTERVAL_SECONDS = int(os.environ.get("ACCOUNT_EQUITY_INTERVAL_SECONDS", "900") or 900)
+RECENT_BACKTEST_EVIDENCE_FRESH_SECONDS = int(os.environ.get("RECENT_BACKTEST_EVIDENCE_FRESH_SECONDS", str(6 * 60 * 60)) or (6 * 60 * 60))
+MAX_AUTO_REFRESH_ESTIMATED_REQUESTS = int(os.environ.get("MAX_AUTO_REFRESH_ESTIMATED_REQUESTS", "80") or 80)
 OKX_ENV_KEYS = ("OKX_API_KEY", "OKX_API_SECRET", "OKX_API_PASSPHRASE")
+OKX_KEYCHAIN_SERVICE = os.environ.get("OKX_KEYCHAIN_SERVICE", "okx-perp-bot")
+AUTOMATION_HEARTBEAT_INTERVAL_SECONDS = int(os.environ.get("AUTOMATION_HEARTBEAT_INTERVAL_SECONDS", "60") or 60)
 OKX_API_BASE_URL = os.environ.get("OKX_API_BASE_URL", "https://www.okx.com").rstrip("/")
 OKX_BROWSER_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"
+OKX_READONLY_PRIVATE_PATHS = (
+    "/api/v5/account/config",
+    "/api/v5/account/balance",
+    "/api/v5/account/positions",
+    "/api/v5/trade/order",
+)
+OKX_LIVE_ORDER_PATH = "/api/v5/trade/order"
+OKX_LIVE_CANCEL_PATH = "/api/v5/trade/cancel-order"
+AI4TRADE_API_BASE_URL = os.environ.get("AI4TRADE_API_BASE_URL", "https://ai4trade.ai/api").rstrip("/")
+AI4TRADE_ENV_FILE = Path(os.environ.get("AI4TRADE_ENV_FILE", ROOT / ".env.ai4trade"))
+AI4TRADE_TIMEOUT_SECONDS = float(os.environ.get("AI4TRADE_TIMEOUT_SECONDS", "8") or 8)
+AI4TRADE_SAFE_GET_PATHS = (
+    "/claw/agents/me",
+    "/signals/feed",
+    "/market-intel/overview",
+    "/market-intel/news",
+)
+AI4TRADE_SAFE_POST_PATHS = (
+    "/claw/agents/heartbeat",
+)
 MARKET_DATA = MarketDataStore(CACHE_DIR)
 PORTFOLIO_RESULT_CACHE = ResultCache(ttl_seconds=60, max_items=64)
 SIGNAL_LOG_LOCK = threading.Lock()
 PAPER_EVENT_LOCK = threading.Lock()
 PAPER_AUDIT_LOCK = threading.Lock()
+PAPER_EQUITY_LOCK = threading.Lock()
+ACCOUNT_EQUITY_LOCK = threading.Lock()
 EXECUTION_ORDER_LOCK = threading.Lock()
+AUTOMATION_LOCK = threading.Lock()
+AUTOMATION_PREFLIGHT_LOCK = threading.Lock()
+AUTOMATION_HEARTBEAT_LOCK = threading.Lock()
+AUTOMATION_EVENT_LOCK = threading.Lock()
+AUTOMATION_TASK_ACTION_LOCK = threading.Lock()
+READINESS_SNAPSHOT_LOCK = threading.Lock()
+OKX_DIAGNOSTICS_LOCK = threading.Lock()
+AI4TRADE_HISTORY_LOCK = threading.Lock()
 DATA_REFRESH_LOCK = threading.Lock()
+DATA_REFRESH_RUN_LOCK = threading.Lock()
 DATA_REFRESH_PROGRESS: dict[str, Any] = {
     "active": False,
     "batch_id": None,
@@ -174,24 +225,52 @@ def task_snapshot(task: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in task.items() if key not in {"result"} or value is not None}
 
 
+def task_fingerprint(task_type: str, params: dict[str, Any] | None = None) -> str:
+    payload = {
+        "type": task_type,
+        "params": params or {},
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha1(encoded.encode("utf-8")).hexdigest()
+
+
 def enqueue_task(task_type: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     start_task_worker()
+    task_params = params or {}
+    fingerprint = task_fingerprint(task_type, task_params)
     task_id = f"task-{int(time.time() * 1000)}-{random.randint(1000, 9999)}"
+    now = now_iso()
     task = {
         "id": task_id,
         "type": task_type,
-        "params": params or {},
+        "params": task_params,
+        "fingerprint": fingerprint,
+        "deduped_count": 0,
         "status": "queued",
         "progress": {"completed": 0, "total": 0},
         "result": None,
         "error": None,
         "cancel_requested": False,
-        "created_at": now_iso(),
+        "created_at": now,
         "started_at": None,
         "finished_at": None,
-        "updated_at": now_iso(),
+        "updated_at": now,
     }
     with TASK_CONDITION:
+        for active in TASKS.values():
+            if (
+                active.get("type") == task_type
+                and active.get("fingerprint") == fingerprint
+                and active.get("status") in {"queued", "running"}
+            ):
+                active["deduped_count"] = int(active.get("deduped_count") or 0) + 1
+                active["deduped_at"] = now_iso()
+                active["updated_at"] = active["deduped_at"]
+                snapshot = task_snapshot(active)
+                snapshot["deduped"] = True
+                snapshot["deduped_reason"] = "active_duplicate"
+                save_task_history_unlocked()
+                return snapshot
         TASKS[task_id] = task
         TASK_QUEUE.append(task_id)
         save_task_history_unlocked()
@@ -2973,6 +3052,141 @@ def decimal_step_aligned(value: Decimal, step: Decimal) -> bool:
     return value == floor_to_step(value, step)
 
 
+def parse_iso_timestamp(value: Any) -> datetime | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def execution_order_lifecycle(row: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
+    now = now or datetime.now(timezone.utc)
+    event = str(row.get("event") or "")
+    status = str(row.get("status") or "")
+    created_at = parse_iso_timestamp(row.get("time"))
+    age_seconds = max(0, int((now - created_at).total_seconds())) if created_at else None
+    timeout_seconds = int(row.get("timeout_seconds") or row.get("order_timeout_seconds") or 120)
+    okx_order = row.get("okx_order") if isinstance(row.get("okx_order"), dict) else {}
+    payload = okx_order.get("payload") if isinstance(okx_order.get("payload"), dict) else {}
+    response = row.get("okx_response") if isinstance(row.get("okx_response"), dict) else {}
+    exchange_order_id = row.get("exchange_order_id") or row.get("ord_id") or response.get("ordId") or response.get("ord_id")
+    fill = row.get("fill") if isinstance(row.get("fill"), dict) else {}
+    cancel = row.get("cancel") if isinstance(row.get("cancel"), dict) else {}
+    submitted = event in {"live_submit", "live_submitted", "order_submitted"} or status in {"submitted", "open", "filled", "partially_filled", "cancel_requested", "cancelled"}
+    acknowledged = bool(exchange_order_id)
+    filled = status == "filled" or bool(fill.get("filled") or fill.get("fill_px") or fill.get("fillPx"))
+    cancelled = status in {"cancelled", "canceled"} or bool(cancel.get("cancelled"))
+    expired = bool(submitted and not filled and not cancelled and age_seconds is not None and age_seconds >= timeout_seconds)
+
+    if event == "live_submit_rejected" or status == "rejected":
+        phase = "blocked"
+        label = "提交拒绝"
+        action = (row.get("rejection_reasons") or ["处理最终门槛阻断项后重新预演。"])[0]
+    elif row.get("duplicate_intent") or status == "duplicate":
+        phase = "duplicate"
+        label = "重复意图"
+        action = "保留幂等保护，不要重复提交同一订单意图。"
+    elif status == "no_intent":
+        phase = "no_intent"
+        label = "无订单意图"
+        action = "等待 ready 信号后重新生成执行预演。"
+    elif not submitted:
+        phase = "preview"
+        label = "仅预演"
+        action = "未真实提交，不需要撤单或成交回执。"
+    elif status == "cancel_requested":
+        phase = "cancel_requested"
+        label = "撤单已提交"
+        action = "撤单请求已被发送，继续查询订单状态确认最终撤单结果。"
+    elif filled:
+        phase = "filled"
+        label = "已成交"
+        action = "核对成交均价、手续费和持仓。"
+    elif cancelled:
+        phase = "cancelled"
+        label = "已撤单"
+        action = "确认撤单回执并重新评估信号。"
+    elif expired and not acknowledged:
+        phase = "ack_timeout"
+        label = "回执超时"
+        action = "查询 OKX 订单状态；若有挂单则触发撤单保护。"
+    elif expired:
+        phase = "cancel_due"
+        label = "需撤单"
+        action = "挂单超过等待时间，执行撤单或重新报价。"
+    elif acknowledged:
+        phase = "open"
+        label = "已回执"
+        action = "等待成交或到期撤单。"
+    else:
+        phase = "pending_ack"
+        label = "等待回执"
+        action = "等待 OKX 下单回执，超时后拒绝继续加仓。"
+
+    return {
+        "phase": phase,
+        "label": label,
+        "age_seconds": age_seconds,
+        "timeout_seconds": timeout_seconds,
+        "submitted": submitted,
+        "acknowledged": acknowledged,
+        "exchange_order_id": exchange_order_id,
+        "filled": filled,
+        "cancelled": cancelled,
+        "expired": expired,
+        "order_type": payload.get("ordType"),
+        "client_order_id": payload.get("clOrdId"),
+        "next_action": action,
+        "checks": [
+            {
+                "name": "提交阶段",
+                "status": "pass" if submitted else "info",
+                "value": label,
+                "threshold": "submitted/open/filled",
+                "action": "仅预演或被拒绝时不会触发真实订单生命周期。" if not submitted else "继续跟踪交易所状态。",
+            },
+            {
+                "name": "下单回执",
+                "status": "pass" if acknowledged or not submitted else "fail" if expired else "watch",
+                "value": exchange_order_id or "无回执",
+                "threshold": "OKX ordId",
+                "action": "未提交订单不需要回执。" if not submitted else "超时未收到回执时查询订单或停止继续提交。",
+            },
+            {
+                "name": "挂单超时",
+                "status": "fail" if expired and not filled and not cancelled else "pass" if not submitted or filled or cancelled else "watch",
+                "value": f"{age_seconds if age_seconds is not None else '-'}s",
+                "threshold": f"< {timeout_seconds}s",
+                "action": "挂单超时后撤单，禁止继续加仓。" if expired else "继续跟踪等待时间。",
+            },
+            {
+                "name": "撤单保护",
+                "status": "pass" if cancelled or status == "cancel_requested" or not expired else "fail",
+                "value": "已撤单" if cancelled else "已提交撤单" if status == "cancel_requested" else "待触发" if expired else "未触发",
+                "threshold": "超时必须撤单",
+                "action": "记录撤单回执。" if cancelled else "查询撤单最终状态。" if status == "cancel_requested" else "超时后调用撤单流程。" if expired else "未到撤单条件。",
+            },
+            {
+                "name": "成交回执",
+                "status": "pass" if filled else "info" if not submitted else "watch",
+                "value": "已成交" if filled else "无成交",
+                "threshold": "fill receipt",
+                "action": "成交后同步持仓、手续费和风控。" if filled else "等待成交或撤单回执。",
+            },
+        ],
+    }
+
+
 def read_execution_orders(limit: int = 100) -> dict[str, Any]:
     if not EXECUTION_ORDER_FILE.exists():
         return {"path": str(EXECUTION_ORDER_FILE), "rows": []}
@@ -2981,7 +3195,9 @@ def read_execution_orders(limit: int = 100) -> dict[str, Any]:
         lines = EXECUTION_ORDER_FILE.read_text(encoding="utf-8").splitlines()[-max(1, min(limit, 1000)) :]
     for line in lines:
         try:
-            rows.append(json.loads(line))
+            row = json.loads(line)
+            row["lifecycle"] = execution_order_lifecycle(row)
+            rows.append(row)
         except json.JSONDecodeError:
             continue
     return {"path": str(EXECUTION_ORDER_FILE), "rows": list(reversed(rows))}
@@ -3000,6 +3216,157 @@ def append_execution_order(row: dict[str, Any]) -> dict[str, Any]:
         with EXECUTION_ORDER_FILE.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
     return entry
+
+
+def execution_order_reconcile_adapter_preview(action: str, base: dict[str, Any]) -> dict[str, Any]:
+    okx_order = base.get("okx_order") if isinstance(base.get("okx_order"), dict) else {}
+    payload = okx_order.get("payload") if isinstance(okx_order.get("payload"), dict) else {}
+    inst_id = base.get("inst_id") or payload.get("instId")
+    exchange_order_id = base.get("exchange_order_id")
+    client_order_id = payload.get("clOrdId")
+    identifier: dict[str, str] = {}
+    if exchange_order_id:
+        identifier["ordId"] = str(exchange_order_id)
+    elif client_order_id:
+        identifier["clOrdId"] = str(client_order_id)
+    request_payload = {"instId": inst_id, **identifier}
+    missing = [key for key, value in request_payload.items() if not value]
+    if action == "query":
+        query = urllib.parse.urlencode({key: value for key, value in request_payload.items() if value})
+        request_path = f"/api/v5/trade/order?{query}" if query else "/api/v5/trade/order"
+        request = okx_private_request_preview("GET", request_path)
+        endpoint = "GET /api/v5/trade/order"
+    elif action == "cancel":
+        request = okx_private_request_preview("POST", "/api/v5/trade/cancel-order", request_payload)
+        endpoint = "POST /api/v5/trade/cancel-order"
+    else:
+        return {
+            "ok": False,
+            "action": action,
+            "mode": "manual_receipt_only",
+            "dry_run_only": True,
+            "endpoint": None,
+            "message": "成交回执来自交易所/账户同步，不生成私有接口写入预览。",
+        }
+    return {
+        "ok": not missing and bool(identifier),
+        "action": action,
+        "mode": "dry_run_adapter",
+        "dry_run_only": True,
+        "endpoint": endpoint,
+        "request_preview": request,
+        "request_body": request_payload,
+        "missing_fields": missing + ([] if identifier else ["ordId_or_clOrdId"]),
+        "identifier": identifier,
+        "blocked_reason": okx_connector_status().get("blocked_reason"),
+        "next_action": "核对预览后仍只记录人工回执；真实 query/cancel connector 尚未开放。",
+    }
+
+
+def execution_order_action(params: dict[str, Any]) -> dict[str, Any]:
+    action = str(params.get("action") or "").strip().lower()
+    source = params.get("source") if isinstance(params.get("source"), dict) else {}
+    allowed = {"query", "cancel", "fill"}
+    if action not in allowed:
+        raise ValueError(f"action must be one of: {', '.join(sorted(allowed))}")
+    intent = params.get("order_intent") if isinstance(params.get("order_intent"), dict) else source.get("order_intent")
+    okx_order = params.get("okx_order") if isinstance(params.get("okx_order"), dict) else source.get("okx_order")
+    intent_fingerprint = params.get("intent_fingerprint") or source.get("intent_fingerprint") or order_intent_fingerprint(intent)
+    exchange_order_id = (
+        params.get("exchange_order_id")
+        or source.get("exchange_order_id")
+        or source.get("ord_id")
+        or ((source.get("okx_response") or {}) if isinstance(source.get("okx_response"), dict) else {}).get("ordId")
+    )
+    base = {
+        "intent_fingerprint": intent_fingerprint,
+        "source_event": source.get("event"),
+        "source_time": source.get("time"),
+        "inst_id": params.get("inst_id") or source.get("inst_id") or (intent or {}).get("inst_id"),
+        "bar": params.get("bar") or source.get("bar") or (intent or {}).get("bar"),
+        "side": params.get("side") or source.get("side") or (intent or {}).get("side"),
+        "notional": params.get("notional") or source.get("notional") or (intent or {}).get("notional"),
+        "order_intent": intent,
+        "okx_order": okx_order,
+        "exchange_order_id": exchange_order_id,
+        "manual_action": True,
+        "operator_note": params.get("note") or "",
+    }
+    adapter_preview = execution_order_reconcile_adapter_preview(action, base)
+    if action == "query":
+        live_query_response = None
+        live_query_state = None
+        live_query_order_id = exchange_order_id
+        if params.get("submit_live_query") and adapter_preview.get("ok"):
+            request_path = (adapter_preview.get("request_preview") or {}).get("request_path")
+            live_query_response = okx_private_request("GET", request_path) if request_path else None
+            live_rows = ((live_query_response or {}).get("payload") or {}).get("data") or []
+            live_row = live_rows[0] if live_rows else {}
+            live_query_state = live_row.get("state") or live_row.get("ordState")
+            live_query_order_id = live_row.get("ordId") or live_row.get("ord_id") or live_query_order_id
+        query_state = live_query_state or params.get("state") or ("live" if exchange_order_id else "unknown")
+        query_status = (
+            "filled" if str(query_state).lower() == "filled" else
+            "cancelled" if str(query_state).lower() in {"canceled", "cancelled"} else
+            "open" if str(query_state).lower() in {"live", "partially_filled", "partially-filled"} else
+            "submitted"
+        )
+        row = {
+            **base,
+            "event": "order_status_live_query" if live_query_response else "order_status_check",
+            "status": query_status,
+            "adapter_preview": adapter_preview,
+            "okx_response": (live_query_response or {}).get("payload") if live_query_response else {
+                "ordId": live_query_order_id,
+                "state": query_state,
+                "checked_at": now_iso(),
+                "source": "manual_reconcile",
+            },
+            "exchange_order_id": live_query_order_id,
+            "live_query_response": live_query_response,
+        }
+    elif action == "cancel":
+        live_cancel_response = None
+        cancel_accepted = False
+        if params.get("submit_live_cancel") and adapter_preview.get("ok"):
+            live_cancel_response = okx_private_request("POST", OKX_LIVE_CANCEL_PATH, adapter_preview.get("request_body") or {})
+            cancel_rows = ((live_cancel_response or {}).get("payload") or {}).get("data") or []
+            cancel_row = cancel_rows[0] if cancel_rows else {}
+            cancel_accepted = bool((live_cancel_response or {}).get("ok") and (not cancel_row or str(cancel_row.get("sCode", "0")) == "0"))
+        row = {
+            **base,
+            "event": "order_cancel_submitted" if live_cancel_response and cancel_accepted else "order_cancel_rejected" if live_cancel_response else "order_cancel_recorded",
+            "status": "cancel_requested" if live_cancel_response and cancel_accepted else "rejected" if live_cancel_response else "cancelled",
+            "adapter_preview": adapter_preview,
+            "okx_response": (live_cancel_response or {}).get("payload") if live_cancel_response else None,
+            "live_cancel_response": live_cancel_response,
+            "cancel": {
+                "cancelled": not live_cancel_response,
+                "cancel_requested": bool(live_cancel_response and cancel_accepted),
+                "cancel_id": params.get("cancel_id") or f"manual-cancel-{int(time.time() * 1000)}",
+                "reason": params.get("reason") or ("live cancel submitted" if live_cancel_response and cancel_accepted else "live cancel rejected" if live_cancel_response else "manual lifecycle reconciliation"),
+                "recorded_at": now_iso(),
+            },
+        }
+    else:
+        fill_px = params.get("fill_px") or params.get("fillPx") or (intent or {}).get("entry")
+        fill_sz = params.get("fill_sz") or params.get("fillSz") or (intent or {}).get("qty")
+        row = {
+            **base,
+            "event": "order_fill_recorded",
+            "status": "filled",
+            "adapter_preview": adapter_preview,
+            "fill": {
+                "filled": True,
+                "fill_px": audit_number(fill_px),
+                "fill_sz": audit_number(fill_sz, 8),
+                "fee": audit_number(params.get("fee"), 8),
+                "recorded_at": now_iso(),
+            },
+        }
+    entry = append_execution_order(row)
+    entry["lifecycle"] = execution_order_lifecycle(entry)
+    return {"ok": True, "action": action, "row": entry}
 
 
 def order_intent_from_scan(
@@ -3108,6 +3475,8 @@ def execution_guard(
         )
         leverage = float(intent.get("leverage") or 0)
         max_leverage = float(params.get("max_leverage", params.get("leverage", leverage)))
+        notional = float(intent.get("notional") or 0)
+        max_live_order_notional = float(params.get("max_live_order_notional_usd", params.get("initial_equity", 10)) or 10)
         margin_used = float(intent.get("margin_used") or 0)
         margin_pct = margin_used / max(equity, 1e-9)
         max_margin_pct = float(params.get("max_margin_pct", params.get("margin_pct_per_trade", 1.0)))
@@ -3121,6 +3490,7 @@ def execution_guard(
             liq_buffer_pct = (abs(entry - float(liquidation_price)) - abs(entry - stop)) / entry
         min_liq_buffer = float(params.get("min_liq_buffer_pct", 0.003))
         add("杠杆上限", leverage <= max_leverage, leverage, f"<= {max_leverage:g}x", "降低杠杆或仓位。")
+        add("单笔名义上限", notional > 0 and notional <= max_live_order_notional, notional, f"<= {max_live_order_notional:g} USDT", "降低名义金额或提高 max_live_order_notional_usd。")
         add("保证金占用", margin_pct <= max_margin_pct, margin_pct, f"<= {max_margin_pct:.0%}", "降低名义金额。")
         add("单笔风险", risk_pct <= max_loss_pct, risk_pct, f"<= {max_loss_pct:.0%}", "降低 risk_pct 或放弃信号。")
         add("强平缓冲", liq_buffer_pct is not None and liq_buffer_pct >= min_liq_buffer, liq_buffer_pct, f">= {min_liq_buffer:.2%}", "强平价必须比止损更远。")
@@ -3239,6 +3609,9 @@ def final_submission_gate(
     account_equity = safe_float((okx_account or {}).get("total_equity_usd"))
     min_live_equity = safe_float(params.get("min_live_equity_usd", params.get("initial_equity", 10)), 10.0)
     margin_used = safe_float((intent or {}).get("margin_used"))
+    notional = safe_float((intent or {}).get("notional"))
+    max_live_order_notional = safe_float(params.get("max_live_order_notional_usd", params.get("initial_equity", 10)), 10.0)
+    canary_order_notional = safe_float(params.get("canary_order_notional_usd", min(max_live_order_notional, 10.0)), min(max_live_order_notional, 10.0))
     margin_buffer_mult = safe_float(params.get("live_margin_buffer_mult", 1.2), 1.2)
     required_margin_buffer = margin_used * margin_buffer_mult if intent else 0.0
     validation = (exchange_rules or {}).get("validation") or {}
@@ -3249,6 +3622,21 @@ def final_submission_gate(
     add("行情新鲜度", bool(data_quality and data_quality.get("ok")), (data_quality or {}).get("status", "unknown"), "fresh", (data_quality or {}).get("message") or "先使用最新 OKX 行情完成预演。")
     add("OKX只读连通", okx_readonly_ok, "已连接" if okx_readonly_ok else (okx_account or {}).get("error", "未连接"), "account/balance ok", "先通过 OKX 只读账户诊断。")
     add("账户最低权益", account_equity >= min_live_equity, account_equity, f">= {min_live_equity:g} USDT", "账户权益不足，先入金或降低 min_live_equity_usd。")
+    add(
+        "单笔名义上限",
+        intent is not None and notional > 0 and notional <= max_live_order_notional,
+        notional if intent else "无",
+        f"<= {max_live_order_notional:g} USDT",
+        "降低下单名义金额或提高 max_live_order_notional_usd；小额试运行前建议使用 canary 限额。",
+    )
+    add(
+        "Canary试运行",
+        intent is not None and canary_order_notional > 0 and canary_order_notional <= max_live_order_notional,
+        canary_order_notional,
+        f"<= {max_live_order_notional:g} USDT",
+        "先设定不超过单笔上限的 canary_order_notional_usd。",
+        "warn",
+    )
     add(
         "保证金缓冲",
         intent is not None and account_equity >= required_margin_buffer,
@@ -3261,7 +3649,16 @@ def final_submission_gate(
     add("OKX payload", payload_ready, (okx_order or {}).get("status") or "missing", "ready", (okx_order or {}).get("message") or "先生成可审计的 OKX 下单 payload。")
     add("幂等检查", not duplicate_intent, order_intent_fingerprint(intent) or "无", "未见重复", "同一订单意图已记录，拒绝重复提交。")
     add("实盘总开关", LIVE_TRADING_ENABLED, LIVE_TRADING_ENABLED, "LIVE_TRADING_ENABLED=true", "当前仍保持真实下单总锁关闭。", "live_lock")
-    add("连接器实现", False, "not_configured", "OKX live connector", "真实下单连接器尚未开放。", "live_lock")
+    connector = okx_connector_status()
+    add("连接器适配", True, connector.get("name"), "safe adapter", "OKX 安全适配层已可生成签名请求预览。")
+    add(
+        "真实提交权限",
+        bool(connector.get("can_submit_live")),
+        "enabled" if connector.get("can_submit_live") else "dry_run_only",
+        "LIVE_TRADING_ENABLED + OKX_LIVE_ORDER_ENABLED",
+        connector.get("blocked_reason"),
+        "live_lock",
+    )
 
     blocked = [row for row in checks if not row["passed"]]
     live_locks = [row for row in blocked if row["severity"] == "live_lock"]
@@ -3275,6 +3672,9 @@ def final_submission_gate(
         "account_equity": account_equity,
         "min_live_equity_usd": min_live_equity,
         "required_margin_buffer": required_margin_buffer,
+        "order_notional": notional,
+        "max_live_order_notional_usd": max_live_order_notional,
+        "canary_order_notional_usd": canary_order_notional,
         "okx_position_count": okx_position_count,
         "updated_at": now_iso(),
     }
@@ -3321,6 +3721,7 @@ def execution_dry_run(params: dict[str, Any]) -> dict[str, Any]:
     }
     intent_fingerprint = order_intent_fingerprint(intent)
     okx_order = okx_order_payload_preview(intent, exchange_rules["validation"], run_params, intent_fingerprint)
+    canary_order = canary_order_preview(intent, instrument_rules, run_params, intent_fingerprint)
     duplicate_intent = bool(intent_fingerprint and intent_fingerprint in execution_order_fingerprints())
     guard = execution_guard(
         intent,
@@ -3344,6 +3745,13 @@ def execution_dry_run(params: dict[str, Any]) -> dict[str, Any]:
         run_params,
         duplicate_intent=duplicate_intent,
         data_quality=data_quality,
+    )
+    shadow_order = okx_shadow_order_evidence(
+        okx_order,
+        final_gate,
+        canary_order=canary_order,
+        submit_mode="standard",
+        source="execution_dry_run",
     )
     order_status = "duplicate" if duplicate_intent else "candidate" if intent else "no_intent"
     result = {
@@ -3378,6 +3786,8 @@ def execution_dry_run(params: dict[str, Any]) -> dict[str, Any]:
         "equity_source": equity_source,
         "exchange_rules": exchange_rules,
         "okx_order": okx_order,
+        "canary_order": canary_order,
+        "shadow_order": shadow_order,
     }
     append_execution_order(
         {
@@ -3397,6 +3807,8 @@ def execution_dry_run(params: dict[str, Any]) -> dict[str, Any]:
             "okx_position_count": result["okx"].get("position_count"),
             "exchange_validation": exchange_rules.get("validation"),
             "okx_order": okx_order,
+            "canary_order": canary_order,
+            "shadow_order": shadow_order,
             "final_gate": final_gate,
             "data_quality": data_quality,
             "readiness_decision": result["readiness"].get("decision"),
@@ -3424,6 +3836,8 @@ def execution_dry_run(params: dict[str, Any]) -> dict[str, Any]:
             "okx": result["okx"],
             "exchange_rules": exchange_rules,
             "okx_order": okx_order,
+            "canary_order": canary_order,
+            "shadow_order": shadow_order,
             "scan": result["scan"],
             "scan_signature": paper_scan_signature(scan),
             "actions": [{"type": "execution_dry_run", "decision": guard.get("decision")}],
@@ -3432,22 +3846,1428 @@ def execution_dry_run(params: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def automation_default_state() -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "mode": "auto_dry_run_preflight",
+        "state": "waiting_ready_signal",
+        "last_signal_hash": None,
+        "last_preflight_hash": None,
+        "last_signal": None,
+        "last_preflight": None,
+        "last_heartbeat": None,
+        "heartbeat_count": 0,
+        "last_error": None,
+        "updated_at": now_iso(),
+    }
+
+
+def load_automation_state() -> dict[str, Any]:
+    if not AUTOMATION_STATE_FILE.exists():
+        return automation_default_state()
+    try:
+        payload = json.loads(AUTOMATION_STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return automation_default_state()
+        return {**automation_default_state(), **payload}
+    except Exception:
+        return automation_default_state()
+
+
+def save_automation_state(state: dict[str, Any]) -> dict[str, Any]:
+    CACHE_DIR.mkdir(exist_ok=True)
+    payload = {**automation_default_state(), **state, "updated_at": now_iso()}
+    tmp = AUTOMATION_STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(AUTOMATION_STATE_FILE)
+    return payload
+
+
+def automation_signal_hash(scan: dict[str, Any] | None, inst_id: str | None = None, bar: str | None = None) -> str:
+    signature = {
+        "inst_id": inst_id or (scan or {}).get("inst_id"),
+        "bar": bar,
+        **paper_scan_signature(scan),
+    }
+    raw = json.dumps(signature, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def automation_scan_summary(scan: dict[str, Any] | None, inst_id: str | None = None, bar: str | None = None) -> dict[str, Any]:
+    scan = scan or {}
+    signal = scan.get("signal") or {}
+    position = scan.get("position") or {}
+    context = scan.get("context") or {}
+    return {
+        "hash": automation_signal_hash(scan, inst_id, bar),
+        "inst_id": inst_id or scan.get("inst_id"),
+        "bar": bar,
+        "status": scan.get("status"),
+        "decision": scan.get("decision"),
+        "context_time": context.get("time"),
+        "side": position.get("side") or signal.get("side"),
+        "kind": signal.get("kind") or position.get("kind"),
+        "score": audit_number(scan.get("score") if scan.get("score") is not None else signal.get("score"), 6),
+        "entry": audit_number(position.get("entry") or signal.get("entry")),
+        "notional": audit_number(position.get("notional"), 4),
+        "signature": paper_scan_signature(scan),
+    }
+
+
+def automation_policy() -> dict[str, Any]:
+    connector = okx_connector_status()
+    return {
+        "dry_run_only": bool(connector.get("dry_run_only")),
+        "can_submit_live": bool(connector.get("can_submit_live")),
+        "auto_submit_live": False,
+        "live_order_enabled": OKX_LIVE_ORDER_ENABLED,
+        "live_cancel_enabled": OKX_LIVE_CANCEL_ENABLED,
+        "mode": "ready_signal_to_dry_run_preflight",
+        "next_live_stage": "manual_canary_unlock_required",
+    }
+
+
+def iso_age_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        raw = value.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(raw)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - parsed).total_seconds())
+    except Exception:
+        return None
+
+
+def automation_heartbeat_history_entry(heartbeat: dict[str, Any], *, count: int | None = None) -> dict[str, Any]:
+    return {
+        "time": heartbeat.get("time") or now_iso(),
+        "source": heartbeat.get("source"),
+        "count": count,
+        "paper_running": bool(heartbeat.get("paper_running")),
+        "paper_updated_at": heartbeat.get("paper_updated_at"),
+        "inst_id": heartbeat.get("inst_id"),
+        "bar": heartbeat.get("bar"),
+        "equity": audit_number(heartbeat.get("equity")),
+        "signal_status": heartbeat.get("signal_status"),
+        "signal_decision": heartbeat.get("signal_decision"),
+        "state": heartbeat.get("state"),
+        "dry_run_only": True,
+        "can_submit_live": False,
+        "interval_seconds": AUTOMATION_HEARTBEAT_INTERVAL_SECONDS,
+    }
+
+
+def append_automation_heartbeat_history(heartbeat: dict[str, Any], *, count: int | None = None) -> dict[str, Any]:
+    entry = automation_heartbeat_history_entry(heartbeat, count=count)
+    CACHE_DIR.mkdir(exist_ok=True)
+    with AUTOMATION_HEARTBEAT_LOCK:
+        with AUTOMATION_HEARTBEAT_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return entry
+
+
+def read_automation_heartbeat_history(limit: int = 50) -> dict[str, Any]:
+    if not AUTOMATION_HEARTBEAT_FILE.exists():
+        return {"path": str(AUTOMATION_HEARTBEAT_FILE), "rows": [], "count": 0}
+    rows = []
+    with AUTOMATION_HEARTBEAT_LOCK:
+        lines = AUTOMATION_HEARTBEAT_FILE.read_text(encoding="utf-8").splitlines()[-max(1, min(limit, 500)) :]
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    rows = list(reversed(rows))
+    return {"path": str(AUTOMATION_HEARTBEAT_FILE), "rows": rows, "count": len(rows), "latest": rows[0] if rows else None}
+
+
+def automation_record_heartbeat(snapshot: dict[str, Any] | None = None, scan: dict[str, Any] | None = None, *, source: str = "paper_loop") -> dict[str, Any]:
+    snapshot = snapshot or {}
+    scan = scan or {}
+    with AUTOMATION_LOCK:
+        state = load_automation_state()
+        last_age = iso_age_seconds((state.get("last_heartbeat") or {}).get("time") if isinstance(state.get("last_heartbeat"), dict) else None)
+        if last_age is not None and last_age < AUTOMATION_HEARTBEAT_INTERVAL_SECONDS:
+            return state
+        policy = automation_policy()
+        heartbeat = {
+            "time": now_iso(),
+            "source": source,
+            "paper_running": bool(snapshot.get("running")),
+            "paper_updated_at": snapshot.get("updated_at"),
+            "inst_id": snapshot.get("inst_id"),
+            "bar": snapshot.get("bar"),
+            "equity": audit_number(snapshot.get("equity")),
+            "signal_status": scan.get("status"),
+            "signal_decision": scan.get("decision"),
+            "state": state.get("state"),
+            "dry_run_only": bool(policy.get("dry_run_only")),
+            "can_submit_live": bool(policy.get("can_submit_live")),
+        }
+        saved = save_automation_state(
+            {
+                **state,
+                "last_heartbeat": heartbeat,
+                "heartbeat_count": int(state.get("heartbeat_count") or 0) + 1,
+            }
+        )
+        append_automation_heartbeat_history(heartbeat, count=int(saved.get("heartbeat_count") or 0))
+        return saved
+
+
+def automation_readiness(
+    state: dict[str, Any],
+    policy: dict[str, Any],
+    *,
+    signal_ready: bool,
+    preflight_current: bool,
+    heartbeat_fresh: bool,
+) -> dict[str, Any]:
+    credentials = okx_credentials_status()
+    last_preflight = state.get("last_preflight") if isinstance(state.get("last_preflight"), dict) else {}
+    checks = [
+        {
+            "name": "本地心跳",
+            "passed": bool(heartbeat_fresh),
+            "status": "pass" if heartbeat_fresh else "warn",
+            "detail": "自动化 heartbeat 新鲜" if heartbeat_fresh else "等待 paper loop 写入 heartbeat",
+        },
+        {
+            "name": "实盘锁",
+            "passed": bool(policy.get("dry_run_only") and not policy.get("can_submit_live")),
+            "status": "pass" if policy.get("dry_run_only") and not policy.get("can_submit_live") else "fail",
+            "detail": "真实提交锁定" if policy.get("dry_run_only") and not policy.get("can_submit_live") else "真实提交锁异常",
+        },
+        {
+            "name": "OKX密钥",
+            "passed": bool(credentials.get("configured")),
+            "status": "pass" if credentials.get("configured") else "warn",
+            "detail": "Keychain/环境已配置" if credentials.get("configured") else "缺少 OKX API Key / Secret / Passphrase",
+        },
+        {
+            "name": "ready信号预检",
+            "passed": bool((not signal_ready) or preflight_current),
+            "status": "pass" if (not signal_ready) or preflight_current else "warn",
+            "detail": "当前 ready 信号已覆盖" if signal_ready and preflight_current else "等待 ready 信号" if not signal_ready else "ready 信号未完成 dry-run 预检",
+        },
+        {
+            "name": "最近dry-run",
+            "passed": bool(last_preflight),
+            "status": "pass" if last_preflight else "pending",
+            "detail": last_preflight.get("guard_decision") or "等待自动或手动自检",
+        },
+    ]
+    blockers = [row["detail"] for row in checks if row["status"] in {"fail", "warn"} and not row["passed"]]
+    if not credentials.get("configured"):
+        stage = "missing_credentials"
+        label = "缺少OKX密钥"
+    elif signal_ready and not preflight_current:
+        stage = "ready_needs_preflight"
+        label = "ready待预检"
+    elif last_preflight and not last_preflight.get("allow_dry_run"):
+        stage = "preflight_blocked"
+        label = "预检阻断"
+    elif last_preflight and last_preflight.get("allow_dry_run") and policy.get("dry_run_only"):
+        stage = "manual_canary_review"
+        label = "人工Canary审核"
+    else:
+        stage = "waiting_signal"
+        label = "等待信号"
+    return {
+        "stage": stage,
+        "label": label,
+        "checks": checks,
+        "blockers": blockers,
+        "last_guard_decision": last_preflight.get("guard_decision"),
+        "next_action": blockers[0] if blockers else "保持只读观察，等待人工 canary 解锁评审。",
+    }
+
+
+def automation_result_summary(result: dict[str, Any]) -> dict[str, Any]:
+    guard = result.get("guard") or {}
+    final_gate = result.get("final_gate") or {}
+    intent = result.get("order_intent") or {}
+    okx_order = result.get("okx_order") or {}
+    shadow = result.get("shadow_order") if isinstance(result.get("shadow_order"), dict) else {}
+    shadow_gate = shadow.get("final_gate") if isinstance(shadow.get("final_gate"), dict) else {}
+    return {
+        "mode": result.get("mode"),
+        "intent_fingerprint": result.get("intent_fingerprint"),
+        "has_intent": bool(intent),
+        "side": intent.get("side"),
+        "notional": audit_number(intent.get("notional"), 4),
+        "guard_decision": guard.get("decision"),
+        "allow_dry_run": bool(guard.get("allow_dry_run")),
+        "allow_live": bool(guard.get("allow_live")),
+        "blocked_reasons": guard.get("blocked_reasons") or [],
+        "final_gate_status": final_gate.get("status"),
+        "okx_order_ready": bool(okx_order.get("ok")),
+        "okx_order_status": okx_order.get("status"),
+        "equity_source": result.get("equity_source"),
+        "okx_position_count": (result.get("okx") or {}).get("position_count"),
+        "shadow_order": {
+            "present": bool(shadow),
+            "type": shadow.get("type"),
+            "would_submit": bool(shadow.get("would_submit")) if shadow else False,
+            "dry_run_only": bool(shadow.get("dry_run_only")) if shadow else True,
+            "can_submit_live": bool(shadow.get("can_submit_live")) if shadow else False,
+            "payload_ready": bool(shadow.get("payload_ready")) if shadow else False,
+            "payload_sha256": shadow.get("payload_sha256"),
+            "client_order_id": shadow.get("client_order_id"),
+            "blocked_reason": redact_sensitive_text(str(shadow.get("blocked_reason") or "")) or "",
+            "final_gate_decision": shadow_gate.get("decision"),
+        },
+        "updated_at": now_iso(),
+    }
+
+
+def redact_sensitive_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    for env_key in (*OKX_ENV_KEYS, "AI4TRADE_TOKEN", "AI4TRADE_AGENT_ID", "AI4TRADE_AGENT_NAME"):
+        secret = os.environ.get(env_key)
+        if secret and len(secret) >= 3:
+            text = text.replace(secret, "<redacted>")
+    return re.sub(
+        r"(?i)\b(api[_-]?key|apikey|secret|passphrase|signature|sign|token|password)(\s*[:=]\s*)([^,\s;{}\[\]()]+)",
+        r"\1\2<redacted>",
+        text,
+    )
+
+
+def automation_preflight_history_entry(
+    *,
+    source: str,
+    state: str,
+    signal_hash: str,
+    signal: dict[str, Any],
+    summary: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    summary = summary or {}
+    return {
+        "time": now_iso(),
+        "source": source,
+        "state": state,
+        "signal_hash": signal_hash,
+        "signal": {
+            "inst_id": signal.get("inst_id"),
+            "bar": signal.get("bar"),
+            "status": signal.get("status"),
+            "decision": signal.get("decision"),
+            "context_time": signal.get("context_time"),
+            "side": signal.get("side"),
+            "kind": signal.get("kind"),
+            "score": audit_number(signal.get("score"), 6),
+            "notional": audit_number(signal.get("notional"), 4),
+        },
+        "summary": {
+            "mode": summary.get("mode"),
+            "has_intent": bool(summary.get("has_intent")),
+            "side": summary.get("side"),
+            "notional": audit_number(summary.get("notional"), 4),
+            "guard_decision": summary.get("guard_decision"),
+            "allow_dry_run": bool(summary.get("allow_dry_run")),
+            "allow_live": bool(summary.get("allow_live")),
+            "final_gate_status": summary.get("final_gate_status"),
+            "okx_order_ready": bool(summary.get("okx_order_ready")),
+            "equity_source": summary.get("equity_source"),
+            "okx_position_count": summary.get("okx_position_count"),
+            "shadow_order": summary.get("shadow_order") if isinstance(summary.get("shadow_order"), dict) else {},
+        },
+        "error": redact_sensitive_text(error),
+        "dry_run_only": True,
+        "can_submit_live": False,
+    }
+
+
+def append_automation_preflight_history(
+    *,
+    source: str,
+    state: str,
+    signal_hash: str,
+    signal: dict[str, Any],
+    summary: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    entry = automation_preflight_history_entry(
+        source=source,
+        state=state,
+        signal_hash=signal_hash,
+        signal=signal,
+        summary=summary,
+        error=error,
+    )
+    with AUTOMATION_PREFLIGHT_LOCK:
+        with AUTOMATION_PREFLIGHT_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return entry
+
+
+def read_automation_preflight_history(limit: int = 50) -> dict[str, Any]:
+    if not AUTOMATION_PREFLIGHT_FILE.exists():
+        return {"path": str(AUTOMATION_PREFLIGHT_FILE), "rows": [], "count": 0}
+    rows = []
+    with AUTOMATION_PREFLIGHT_LOCK:
+        lines = AUTOMATION_PREFLIGHT_FILE.read_text(encoding="utf-8").splitlines()[-max(1, min(limit, 500)) :]
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    rows = list(reversed(rows))
+    return {"path": str(AUTOMATION_PREFLIGHT_FILE), "rows": rows, "count": len(rows), "latest": rows[0] if rows else None}
+
+
+def automation_stage_event_identity(event: dict[str, Any] | None) -> tuple[Any, ...]:
+    event = event or {}
+    preflight = event.get("preflight") if isinstance(event.get("preflight"), dict) else {}
+    return (
+        event.get("stage"),
+        event.get("automation_state"),
+        event.get("signal_hash"),
+        event.get("preflight_hash"),
+        preflight.get("guard_decision"),
+        preflight.get("updated_at"),
+    )
+
+
+def automation_stage_event_entry(
+    state: dict[str, Any],
+    readiness: dict[str, Any],
+    policy: dict[str, Any],
+    *,
+    source: str = "automation_status",
+) -> dict[str, Any]:
+    signal = state.get("last_signal") if isinstance(state.get("last_signal"), dict) else {}
+    preflight = state.get("last_preflight") if isinstance(state.get("last_preflight"), dict) else {}
+    blockers = readiness.get("blockers") if isinstance(readiness.get("blockers"), list) else []
+    return {
+        "time": now_iso(),
+        "source": source,
+        "stage": readiness.get("stage"),
+        "label": readiness.get("label"),
+        "automation_state": state.get("state"),
+        "next_action": redact_sensitive_text(str(readiness.get("next_action") or "")) or "",
+        "blockers": [redact_sensitive_text(str(item)) or "" for item in blockers[:6]],
+        "signal_hash": state.get("last_signal_hash"),
+        "preflight_hash": state.get("last_preflight_hash"),
+        "signal": {
+            "inst_id": signal.get("inst_id"),
+            "bar": signal.get("bar"),
+            "status": signal.get("status"),
+            "decision": redact_sensitive_text(str(signal.get("decision") or "")) or "",
+            "side": signal.get("side"),
+            "kind": signal.get("kind"),
+            "score": audit_number(signal.get("score"), 6),
+            "notional": audit_number(signal.get("notional"), 4),
+        },
+        "preflight": {
+            "mode": preflight.get("mode"),
+            "guard_decision": redact_sensitive_text(str(preflight.get("guard_decision") or "")) or "",
+            "allow_dry_run": bool(preflight.get("allow_dry_run")),
+            "allow_live": bool(preflight.get("allow_live")),
+            "final_gate_status": preflight.get("final_gate_status"),
+            "okx_order_ready": bool(preflight.get("okx_order_ready")),
+            "equity_source": preflight.get("equity_source"),
+            "okx_position_count": preflight.get("okx_position_count"),
+            "shadow_order": preflight.get("shadow_order") if isinstance(preflight.get("shadow_order"), dict) else {},
+            "updated_at": preflight.get("updated_at"),
+        },
+        "heartbeat_count": int(state.get("heartbeat_count") or 0),
+        "dry_run_only": bool(policy.get("dry_run_only")),
+        "can_submit_live": bool(policy.get("can_submit_live")),
+    }
+
+
+def append_automation_stage_event(event: dict[str, Any]) -> dict[str, Any]:
+    CACHE_DIR.mkdir(exist_ok=True)
+    with AUTOMATION_EVENT_LOCK:
+        with AUTOMATION_EVENT_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+    return event
+
+
+def read_automation_event_history(limit: int = 50) -> dict[str, Any]:
+    if not AUTOMATION_EVENT_FILE.exists():
+        return {"path": str(AUTOMATION_EVENT_FILE), "rows": [], "count": 0}
+    rows = []
+    with AUTOMATION_EVENT_LOCK:
+        lines = AUTOMATION_EVENT_FILE.read_text(encoding="utf-8").splitlines()[-max(1, min(limit, 500)) :]
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    rows = list(reversed(rows))
+    return {"path": str(AUTOMATION_EVENT_FILE), "rows": rows, "count": len(rows), "latest": rows[0] if rows else None}
+
+
+def automation_record_stage_event(
+    readiness: dict[str, Any],
+    policy: dict[str, Any],
+    *,
+    source: str = "automation_status",
+) -> dict[str, Any]:
+    with AUTOMATION_LOCK:
+        state = load_automation_state()
+        event = automation_stage_event_entry(state, readiness, policy, source=source)
+        last = state.get("last_stage_event") if isinstance(state.get("last_stage_event"), dict) else None
+        if automation_stage_event_identity(last) == automation_stage_event_identity(event):
+            return {"written": False, "event": last or event, "state": state}
+        append_automation_stage_event(event)
+        saved = save_automation_state({**state, "last_stage_event": event})
+        return {"written": True, "event": event, "state": saved}
+
+
+def market_data_maintenance_task(cache: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    cache_payload = cache if isinstance(cache, dict) else cache_status()
+    rows = cache_payload.get("rows") if isinstance(cache_payload.get("rows"), list) else []
+    recommended_rows = [row for row in rows if isinstance(row, dict) and row.get("recommended_refresh")]
+    if not recommended_rows:
+        return None
+
+    strategy_symbols = {"BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"}
+    strategy_bars = {"15m", "1H"}
+    strategy_recommended = [
+        row
+        for row in recommended_rows
+        if row.get("inst_id") in strategy_symbols
+        and row.get("bar") in strategy_bars
+        and not row.get("covered_by_fresh_cache")
+    ]
+    top = recommended_rows[0] if recommended_rows else {}
+    top_label = " ".join(
+        str(part)
+        for part in (top.get("inst_id"), top.get("bar"), top.get("count") or top.get("candles"))
+        if part not in (None, "")
+    )
+    detail = f"{len(recommended_rows)} 项行情缓存建议刷新"
+    if strategy_recommended:
+        detail += f"；策略核心 {len(strategy_recommended)} 项"
+    if top_label:
+        detail += f"；优先 {top_label}"
+    if top.get("refresh_cost_label"):
+        detail += f" · {top.get('refresh_cost_label')}"
+
+    return {
+        "id": "refresh_market_data",
+        "title": "刷新行情缓存",
+        "status": "maintenance",
+        "detail": detail,
+        "action": "分批刷新 recommended 缓存，完成后写入维护证据并重新运行 recent-backtest。",
+        "command": "python3 scripts/manage_24x7.py refresh-market-data --max-items 2 --timeout 90 --poll 2 --write",
+        "priority": 55,
+    }
+
+
+def automation_task_board(
+    state: dict[str, Any],
+    readiness: dict[str, Any],
+    policy: dict[str, Any],
+    *,
+    signal_ready: bool,
+    preflight_current: bool,
+    heartbeat_fresh: bool,
+    event_history: dict[str, Any],
+    data_cache: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    tasks: list[dict[str, Any]] = []
+
+    def add_task(
+        task_id: str,
+        title: str,
+        status: str,
+        detail: str,
+        action: str,
+        *,
+        command: str | None = None,
+        priority: int = 50,
+    ) -> None:
+        tasks.append(
+            {
+                "id": task_id,
+                "title": title,
+                "status": status,
+                "detail": redact_sensitive_text(detail) or "",
+                "action": redact_sensitive_text(action) or "",
+                "command": command,
+                "priority": priority,
+                "dry_run_only": bool(policy.get("dry_run_only")),
+                "can_submit_live": bool(policy.get("can_submit_live")),
+            }
+        )
+
+    credentials = okx_credentials_status()
+    live_locked = bool(policy.get("dry_run_only") and not policy.get("can_submit_live"))
+    if not live_locked:
+        add_task(
+            "restore_live_lock",
+            "恢复实盘锁",
+            "critical",
+            "自动化检测到真实提交锁异常。",
+            "立即停止自动化并恢复 LIVE_TRADING_ENABLED=0 / OKX_LIVE_ORDER_ENABLED=0。",
+            command="python3 scripts/manage_24x7.py restart backend watchdog",
+            priority=0,
+        )
+    if not heartbeat_fresh:
+        add_task(
+            "restore_heartbeat",
+            "恢复自动化心跳",
+            "warning",
+            "paper loop heartbeat 不新鲜。",
+            "检查 backend 和 paper loop，必要时重启 backend。",
+            command="python3 scripts/manage_24x7.py doctor",
+            priority=10,
+        )
+    if not credentials.get("configured"):
+        add_task(
+            "import_okx_keychain",
+            "导入 OKX Keychain",
+            "blocked",
+            "缺少 OKX API Key / Secret / Passphrase，无法读取真实账户或进入只读实盘验证。",
+            "使用交互式 Keychain 导入，导入后重启 backend/watchdog。",
+            command="python3 scripts/manage_24x7.py import-secrets --restart",
+            priority=20,
+        )
+    elif readiness.get("stage") == "ready_needs_preflight":
+        add_task(
+            "run_ready_preflight",
+            "运行 ready 信号预检",
+            "ready",
+            "当前 ready 信号还没有覆盖 dry-run 预检。",
+            "运行自动化预检，生成订单意图、OKX payload 预览和最终门槛。",
+            command="POST /api/automation/preflight",
+            priority=25,
+        )
+    elif readiness.get("stage") == "preflight_blocked":
+        add_task(
+            "review_blocked_preflight",
+            "复核阻断预检",
+            "blocked",
+            readiness.get("last_guard_decision") or "最近 dry-run 被风控阻断。",
+            "查看阻断原因、行情新鲜度和风险阈值；不要真实提交。",
+            priority=30,
+        )
+    elif readiness.get("stage") == "manual_canary_review":
+        add_task(
+            "manual_canary_review",
+            "人工 Canary 审核",
+            "review",
+            "dry-run 已生成，真实提交仍被本地锁定。",
+            "人工复核 10 USDT Canary payload、账户权益、持仓和执行账本。",
+            priority=35,
+        )
+    elif signal_ready and preflight_current:
+        add_task(
+            "observe_current_signal",
+            "观察当前 ready 信号",
+            "observe",
+            "当前 ready 信号已完成 dry-run 预检。",
+            "继续观察信号变化，真实提交保持锁定。",
+            priority=45,
+        )
+    else:
+        add_task(
+            "wait_for_ready_signal",
+            "等待 ready 信号",
+            "waiting",
+            "当前没有需要预检的新 ready 信号。",
+            "保持 paper loop、AI4Trade 和 watchdog 运行。",
+            priority=60,
+        )
+    maintenance_task = market_data_maintenance_task(data_cache)
+    if maintenance_task:
+        add_task(
+            maintenance_task["id"],
+            maintenance_task["title"],
+            maintenance_task["status"],
+            maintenance_task["detail"],
+            maintenance_task["action"],
+            command=maintenance_task.get("command"),
+            priority=int(maintenance_task.get("priority") or 55),
+        )
+    if not (event_history.get("count") or 0):
+        add_task(
+            "record_stage_event",
+            "写入阶段事件",
+            "observe",
+            "自动化阶段事件历史为空。",
+            "刷新 automation status，写入首条阶段事件。",
+            command="GET /api/automation/status",
+            priority=70,
+        )
+    tasks.sort(key=lambda item: int(item.get("priority") or 50))
+    return {
+        "tasks": tasks,
+        "count": len(tasks),
+        "critical_count": sum(1 for item in tasks if item.get("status") == "critical"),
+        "blocked_count": sum(1 for item in tasks if item.get("status") == "blocked"),
+        "top_task": tasks[0] if tasks else None,
+        "updated_at": now_iso(),
+    }
+
+
+def automation_task_action_entry(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    payload = payload or {}
+    policy = automation_policy()
+    task_id = str(payload.get("task_id") or payload.get("id") or "").strip()
+    action = str(payload.get("action") or "acknowledged").strip() or "acknowledged"
+    status = str(payload.get("status") or action).strip() or action
+    return {
+        "time": now_iso(),
+        "task_id": task_id,
+        "action": redact_sensitive_text(action) or "",
+        "status": redact_sensitive_text(status) or "",
+        "source": redact_sensitive_text(str(payload.get("source") or "operator")) or "operator",
+        "note": redact_sensitive_text(str(payload.get("note") or "")) or "",
+        "dry_run_only": bool(policy.get("dry_run_only")),
+        "can_submit_live": bool(policy.get("can_submit_live")),
+    }
+
+
+def append_automation_task_action(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    entry = automation_task_action_entry(payload)
+    if not entry["task_id"]:
+        return {"ok": False, "error": "task_id is required", "entry": entry}
+    CACHE_DIR.mkdir(exist_ok=True)
+    with AUTOMATION_TASK_ACTION_LOCK:
+        with AUTOMATION_TASK_ACTION_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return {"ok": True, "entry": entry, "path": str(AUTOMATION_TASK_ACTION_FILE)}
+
+
+def read_automation_task_actions(limit: int = 50) -> dict[str, Any]:
+    if not AUTOMATION_TASK_ACTION_FILE.exists():
+        return {"path": str(AUTOMATION_TASK_ACTION_FILE), "rows": [], "count": 0, "latest": None}
+    rows = []
+    with AUTOMATION_TASK_ACTION_LOCK:
+        lines = AUTOMATION_TASK_ACTION_FILE.read_text(encoding="utf-8").splitlines()[-max(1, min(limit, 500)) :]
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    rows = list(reversed(rows))
+    return {"path": str(AUTOMATION_TASK_ACTION_FILE), "rows": rows, "count": len(rows), "latest": rows[0] if rows else None}
+
+
+def automation_shadow_lock_ok(shadow: dict[str, Any] | None) -> bool:
+    if not isinstance(shadow, dict) or not shadow:
+        return False
+    return bool(
+        shadow.get("present", True)
+        and shadow.get("would_submit") is False
+        and shadow.get("dry_run_only") is True
+        and shadow.get("can_submit_live") is False
+        and not bool(shadow.get("submitted"))
+    )
+
+
+def automation_no_real_submitted_orders(limit: int = 200) -> bool:
+    for row in read_execution_orders(limit).get("rows", []):
+        event = str(row.get("event") or "")
+        status = str(row.get("status") or "")
+        if event in {"live_submit", "live_submitted", "order_submitted"} or status in {"submitted", "open", "filled", "partially_filled", "cancel_requested", "cancelled"}:
+            return False
+    return True
+
+
+def automation_readiness_summary(
+    readiness: dict[str, Any],
+    policy: dict[str, Any],
+    *,
+    heartbeat_fresh: bool,
+    preflight_history: dict[str, Any],
+    event_history: dict[str, Any],
+    task_board: dict[str, Any],
+) -> dict[str, Any]:
+    latest_preflight = preflight_history.get("latest") if isinstance(preflight_history.get("latest"), dict) else {}
+    latest_event = event_history.get("latest") if isinstance(event_history.get("latest"), dict) else {}
+    preflight_shadow = (latest_preflight.get("summary") or {}).get("shadow_order") if isinstance(latest_preflight, dict) else {}
+    event_shadow = (latest_event.get("preflight") or {}).get("shadow_order") if isinstance(latest_event, dict) else {}
+    shadow = preflight_shadow if isinstance(preflight_shadow, dict) and preflight_shadow else event_shadow if isinstance(event_shadow, dict) else {}
+    credentials = okx_credentials_status()
+    diagnostics = read_okx_diagnostics_history(1)
+    latest_diagnostic = diagnostics.get("latest") if isinstance(diagnostics.get("latest"), dict) else {}
+    readonly_ok = bool(latest_diagnostic.get("readonly_ok"))
+    live_submit_locked = bool(policy.get("dry_run_only") and not policy.get("can_submit_live"))
+    live_env_locked = bool(not LIVE_TRADING_ENABLED and not OKX_LIVE_ORDER_ENABLED and not OKX_LIVE_CANCEL_ENABLED)
+    shadow_ok = automation_shadow_lock_ok(shadow)
+    no_submitted = automation_no_real_submitted_orders()
+    keychain_ok = bool(credentials.get("configured"))
+    stage = readiness.get("stage")
+    top_task = task_board.get("top_task") if isinstance(task_board.get("top_task"), dict) else {}
+    if not keychain_ok:
+        status = "missing_credentials"
+        next_action = top_task.get("command") or "python3 scripts/manage_24x7.py import-secrets --restart"
+    elif not readonly_ok:
+        status = "readonly_failed"
+        next_action = "运行 OKX 只读诊断并检查权限/IP/签名。"
+    elif not (live_submit_locked and live_env_locked):
+        status = "live_lock_unsafe"
+        next_action = "恢复 LIVE_TRADING_ENABLED=0 / OKX_LIVE_ORDER_ENABLED=0 / OKX_LIVE_CANCEL_ENABLED=0。"
+    elif not shadow_ok:
+        status = "shadow_evidence_missing"
+        next_action = "运行一键预演或等待 ready 信号自动预检，生成 shadow_order 锁定证据。"
+    elif stage == "manual_canary_review":
+        status = "canary_review_ready"
+        next_action = "人工复核 Canary payload、账户权益、真实持仓和执行账本。"
+    elif stage == "waiting_signal":
+        status = "waiting_ready_signal"
+        next_action = readiness.get("next_action") or "等待下一条 ready 信号。"
+    else:
+        status = stage or "review_required"
+        next_action = readiness.get("next_action") or top_task.get("action") or "-"
+    readonly_ready = bool(keychain_ok and readonly_ok and live_submit_locked and live_env_locked)
+    canary_review_ready = bool(readonly_ready and shadow_ok and no_submitted and heartbeat_fresh and stage == "manual_canary_review")
+    return {
+        "status": status,
+        "readonly_ready": readonly_ready,
+        "canary_review_ready": canary_review_ready,
+        "next_action": next_action,
+        "blockers": readiness.get("blockers") if isinstance(readiness.get("blockers"), list) else [],
+        "checks": {
+            "keychain_ok": keychain_ok,
+            "okx_readonly_ok": readonly_ok,
+            "heartbeat_fresh": bool(heartbeat_fresh),
+            "shadow_order_locked": shadow_ok,
+            "no_real_submitted_orders": no_submitted,
+            "live_submit_locked": live_submit_locked,
+            "live_env_locked": live_env_locked,
+        },
+        "locks": {
+            "dry_run_only": bool(policy.get("dry_run_only")),
+            "can_submit_live": bool(policy.get("can_submit_live")),
+            "live_trading_enabled": bool(LIVE_TRADING_ENABLED),
+            "live_order_enabled": bool(OKX_LIVE_ORDER_ENABLED),
+            "live_cancel_enabled": bool(OKX_LIVE_CANCEL_ENABLED),
+        },
+        "latest_shadow_order": shadow,
+        "latest_okx_diagnostic": latest_diagnostic,
+        "top_task": top_task,
+        "updated_at": now_iso(),
+    }
+
+
+PRE_LIVE_GATE_PHASES = ("readonly", "canary", "live-submit")
+
+
+def automation_pre_live_gate_check(
+    name: str,
+    ok: bool,
+    detail: str,
+    *,
+    severity: str = "blocker",
+    label: str | None = None,
+    evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "label": label or name,
+        "ok": bool(ok),
+        "severity": severity,
+        "detail": redact_sensitive_text(detail) or "",
+        "evidence": evidence or {},
+    }
+
+
+def automation_safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def automation_ai4trade_alignment_status(
+    readiness_summary: dict[str, Any],
+    policy: dict[str, Any],
+    history: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    history = history if isinstance(history, dict) else read_ai4trade_history(8)
+    latest = history.get("latest") if isinstance(history.get("latest"), dict) else {}
+    signals = latest.get("signals") if isinstance(latest.get("signals"), dict) else {}
+    signal_summary = signals.get("summary") if isinstance(signals.get("summary"), dict) else {}
+    signal_count = automation_safe_int(signal_summary.get("count"))
+    ai_policy = latest.get("policy") if isinstance(latest.get("policy"), dict) else {}
+    locks = readiness_summary.get("locks") if isinstance(readiness_summary.get("locks"), dict) else {}
+    dry_run_only = bool(locks.get("dry_run_only", policy.get("dry_run_only")))
+    can_submit_live = bool(locks.get("can_submit_live", policy.get("can_submit_live")))
+    local_live_locked = bool(dry_run_only and not can_submit_live)
+    trade_locked = bool(ai_policy.get("trade_endpoints_locked"))
+    copy_locked = bool(ai_policy.get("copy_trade_locked", True))
+    publish_locked = bool(ai_policy.get("publish_locked", True))
+    execution_allowed = bool(ai_policy.get("execution_allowed"))
+    okx_bridge = str(ai_policy.get("okx_bridge") or "")
+    bridge_locked = bool(trade_locked and copy_locked and publish_locked and not execution_allowed and "disabled" in okx_bridge.lower())
+    configured = bool(latest.get("configured"))
+    ok = bool(configured and signal_count > 0 and bridge_locked and local_live_locked)
+    detail = (
+        f"signals={signal_count} · "
+        f"ai4trade_bridge={'locked' if bridge_locked else 'unlocked'} · "
+        f"can_submit_live={can_submit_live}"
+    )
+    return {
+        "ok": ok,
+        "detail": detail,
+        "configured": configured,
+        "history_count": automation_safe_int(history.get("count")),
+        "signal_count": signal_count,
+        "local_live_locked": local_live_locked,
+        "bridge_locked": bridge_locked,
+        "trade_endpoints_locked": trade_locked,
+        "copy_trade_locked": copy_locked,
+        "publish_locked": publish_locked,
+        "execution_allowed": execution_allowed,
+        "okx_bridge": okx_bridge,
+        "updated_at": latest.get("time"),
+        "symbols": signal_summary.get("symbols") if isinstance(signal_summary.get("symbols"), list) else [],
+    }
+
+
+def automation_pre_live_gate_payload(
+    phase: str,
+    readiness_summary: dict[str, Any],
+    policy: dict[str, Any],
+    equity_history: dict[str, Any],
+    ai4trade_alignment: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if phase not in PRE_LIVE_GATE_PHASES:
+        raise ValueError(f"unknown pre-live gate phase: {phase}")
+    checks = readiness_summary.get("checks") if isinstance(readiness_summary.get("checks"), dict) else {}
+    locks = readiness_summary.get("locks") if isinstance(readiness_summary.get("locks"), dict) else {}
+    dry_run_only = bool(locks.get("dry_run_only", policy.get("dry_run_only")))
+    can_submit_live = bool(locks.get("can_submit_live", policy.get("can_submit_live")))
+    live_env_locked = not any(
+        bool(locks.get(key))
+        for key in ("live_trading_enabled", "live_order_enabled", "live_cancel_enabled")
+    )
+    equity_source = str(equity_history.get("source") or "")
+    equity_source_label = str(equity_history.get("source_label") or equity_source or "-")
+    equity_latest = equity_history.get("latest") if isinstance(equity_history.get("latest"), dict) else {}
+    equity_source_ok = equity_source == "okx_readonly" and bool(equity_history.get("readonly_ok"))
+    rows: list[dict[str, Any]] = [
+        automation_pre_live_gate_check(
+            "dry_run_only",
+            dry_run_only,
+            f"dry_run_only={dry_run_only}",
+            label="Dry-run总锁",
+        ),
+        automation_pre_live_gate_check(
+            "live_submit_locked",
+            not can_submit_live,
+            f"can_submit_live={can_submit_live}",
+            label="真实提交锁",
+        ),
+        automation_pre_live_gate_check(
+            "live_env_locked",
+            live_env_locked,
+            (
+                f"live_trading_enabled={bool(locks.get('live_trading_enabled'))} "
+                f"live_order_enabled={bool(locks.get('live_order_enabled'))} "
+                f"live_cancel_enabled={bool(locks.get('live_cancel_enabled'))}"
+            ),
+            label="环境实盘锁",
+        ),
+        automation_pre_live_gate_check(
+            "no_real_submitted_orders",
+            bool(checks.get("no_real_submitted_orders")),
+            "本地执行账本无真实 submitted/open/filled 交易所订单",
+            label="真实订单账本",
+        ),
+        automation_pre_live_gate_check(
+            "ai4trade_signal_alignment",
+            bool((ai4trade_alignment or {}).get("ok")),
+            str((ai4trade_alignment or {}).get("detail") or "AI4Trade 只读信号对齐证据缺失"),
+            severity="warning",
+            label="AI4Trade对齐",
+            evidence={key: value for key, value in (ai4trade_alignment or {}).items() if key != "detail"},
+        ),
+    ]
+
+    if phase in {"readonly", "canary", "live-submit"}:
+        rows.extend(
+            [
+                automation_pre_live_gate_check(
+                    "okx_keychain",
+                    bool(checks.get("keychain_ok")),
+                    "OKX Keychain 已配置" if checks.get("keychain_ok") else "缺少 OKX API Key / Secret / Passphrase",
+                    label="OKX Keychain",
+                ),
+                automation_pre_live_gate_check(
+                    "okx_readonly",
+                    bool(checks.get("okx_readonly_ok")),
+                    "OKX只读诊断通过" if checks.get("okx_readonly_ok") else "OKX只读诊断未通过或未运行",
+                    label="OKX只读",
+                ),
+                automation_pre_live_gate_check(
+                    "okx_equity_source",
+                    equity_source_ok,
+                    f"source={equity_source or '-'} · {equity_source_label} · equity={equity_latest.get('equity', '-')}",
+                    label="权益曲线源",
+                    evidence={
+                        "source": equity_source,
+                        "readonly_ok": bool(equity_history.get("readonly_ok")),
+                        "latest_slot": equity_latest.get("slot") or equity_latest.get("time"),
+                    },
+                ),
+            ]
+        )
+
+    if phase in {"canary", "live-submit"}:
+        rows.extend(
+            [
+                automation_pre_live_gate_check(
+                    "shadow_order_locked",
+                    bool(checks.get("shadow_order_locked")),
+                    "shadow order 已生成且 would_submit=false" if checks.get("shadow_order_locked") else "缺少最近 shadow order 锁定证据",
+                    label="影子实盘单",
+                ),
+                automation_pre_live_gate_check(
+                    "heartbeat_fresh",
+                    bool(checks.get("heartbeat_fresh")),
+                    "自动化 heartbeat 新鲜" if checks.get("heartbeat_fresh") else "自动化 heartbeat 不新鲜",
+                    severity="warning",
+                    label="自动化心跳",
+                ),
+                automation_pre_live_gate_check(
+                    "manual_canary_review_ready",
+                    bool(readiness_summary.get("canary_review_ready")),
+                    str(readiness_summary.get("status") or "-"),
+                    label="Canary人工复核",
+                ),
+            ]
+        )
+
+    if phase == "live-submit":
+        rows.append(
+            automation_pre_live_gate_check(
+                "manual_live_unlock_review",
+                False,
+                "真实提交仍需单独代码解锁和人工复核；当前守护运行只允许模拟盘和只读验证。",
+                label="真实提交人工解锁",
+            )
+        )
+
+    blockers = [row for row in rows if not row["ok"] and row["severity"] == "blocker"]
+    warnings = [row for row in rows if not row["ok"] and row["severity"] == "warning"]
+    return {
+        "phase": phase,
+        "label": {
+            "readonly": "只读验证",
+            "canary": "Canary复核",
+            "live-submit": "真实提交",
+        }.get(phase, phase),
+        "status": "go" if not blockers else "no_go",
+        "ok": not blockers,
+        "blockers": blockers,
+        "warnings": warnings,
+        "checks": rows,
+        "next_action": (
+            blockers[0]["detail"]
+            if blockers
+            else readiness_summary.get("next_action")
+            or "继续保持只读观察。"
+        ),
+        "readiness_status": readiness_summary.get("status"),
+        "locks": locks,
+        "generated_at": now_iso(),
+    }
+
+
+def automation_pre_live_gates(
+    readiness_summary: dict[str, Any],
+    policy: dict[str, Any],
+    equity_history: dict[str, Any],
+    ai4trade_alignment: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    phases = [
+        automation_pre_live_gate_payload(phase, readiness_summary, policy, equity_history, ai4trade_alignment)
+        for phase in PRE_LIVE_GATE_PHASES
+    ]
+    return {
+        "phases": phases,
+        "count": len(phases),
+        "go_count": sum(1 for phase in phases if phase.get("ok")),
+        "next_phase": next((phase for phase in phases if not phase.get("ok")), phases[-1] if phases else None),
+        "locks": readiness_summary.get("locks") if isinstance(readiness_summary.get("locks"), dict) else {},
+        "equity_source": equity_history.get("source"),
+        "equity_source_label": equity_history.get("source_label"),
+        "anchor_date": equity_history.get("anchor_date") or ACCOUNT_EQUITY_ANCHOR_DATE,
+        "interval_seconds": equity_history.get("interval_seconds") or ACCOUNT_EQUITY_INTERVAL_SECONDS,
+        "updated_at": now_iso(),
+    }
+
+
+def automation_status() -> dict[str, Any]:
+    with AUTOMATION_LOCK:
+        state = load_automation_state()
+        if not AUTOMATION_STATE_FILE.exists():
+            state = save_automation_state(state)
+    policy = automation_policy()
+    signal_ready = bool((state.get("last_signal") or {}).get("status") == "ready")
+    preflight_current = bool(state.get("last_signal_hash") and state.get("last_signal_hash") == state.get("last_preflight_hash"))
+    live_locked = bool(policy.get("dry_run_only") and not policy.get("can_submit_live"))
+    heartbeat = state.get("last_heartbeat") if isinstance(state.get("last_heartbeat"), dict) else None
+    heartbeat_age = iso_age_seconds((heartbeat or {}).get("time"))
+    heartbeat_fresh = heartbeat_age is None or heartbeat_age <= max(180, AUTOMATION_HEARTBEAT_INTERVAL_SECONDS * 3)
+    readiness = automation_readiness(
+        state,
+        policy,
+        signal_ready=signal_ready,
+        preflight_current=preflight_current,
+        heartbeat_fresh=heartbeat_fresh,
+    )
+    stage_event = automation_record_stage_event(readiness, policy)
+    event_history = read_automation_event_history(12)
+    data_cache = cache_status()
+    task_board = automation_task_board(
+        state,
+        readiness,
+        policy,
+        signal_ready=signal_ready,
+        preflight_current=preflight_current,
+        heartbeat_fresh=heartbeat_fresh,
+        event_history=event_history,
+        data_cache=data_cache,
+    )
+    task_board = {**task_board, "action_history": read_automation_task_actions(12)}
+    heartbeat_history = read_automation_heartbeat_history(12)
+    preflight_history = read_automation_preflight_history(8)
+    readiness_summary = automation_readiness_summary(
+        readiness,
+        policy,
+        heartbeat_fresh=heartbeat_fresh,
+        preflight_history=preflight_history,
+        event_history=event_history,
+        task_board=task_board,
+    )
+    equity_history = read_paper_equity_history(4, f"{ACCOUNT_EQUITY_ANCHOR_DATE}T00:00:00+00:00")
+    ai4trade_alignment = automation_ai4trade_alignment_status(readiness_summary, policy)
+    pre_live_gates = automation_pre_live_gates(readiness_summary, policy, equity_history, ai4trade_alignment)
+    return {
+        "ok": live_locked and heartbeat_fresh and (not signal_ready or preflight_current or state.get("state") == "preflight_running"),
+        "enabled": bool(state.get("enabled", True)),
+        "mode": state.get("mode"),
+        "state": state.get("state"),
+        "policy": policy,
+        "last_signal_hash": state.get("last_signal_hash"),
+        "last_preflight_hash": state.get("last_preflight_hash"),
+        "signal_ready": signal_ready,
+        "preflight_current": preflight_current,
+        "last_signal": state.get("last_signal"),
+        "last_preflight": state.get("last_preflight"),
+        "last_heartbeat": heartbeat,
+        "heartbeat_count": int(state.get("heartbeat_count") or 0),
+        "heartbeat_age_seconds": heartbeat_age,
+        "heartbeat_fresh": heartbeat_fresh,
+        "heartbeat_interval_seconds": AUTOMATION_HEARTBEAT_INTERVAL_SECONDS,
+        "heartbeat_history": heartbeat_history,
+        "readiness": readiness,
+        "readiness_summary": readiness_summary,
+        "pre_live_gates": pre_live_gates,
+        "ai4trade_alignment": ai4trade_alignment,
+        "last_stage_event": stage_event.get("event"),
+        "event_history": event_history,
+        "task_board": task_board,
+        "preflight_history": preflight_history,
+        "last_error": state.get("last_error"),
+        "state_file": str(AUTOMATION_STATE_FILE),
+        "updated_at": state.get("updated_at"),
+        "next_action": (
+            "等待当前 ready 信号预检完成"
+            if state.get("state") == "preflight_running"
+            else "等待下一条 ready 信号"
+            if not signal_ready
+            else "当前 ready 信号已完成 dry-run 预检"
+            if preflight_current
+            else "需要为当前 ready 信号运行 dry-run 预检"
+        ),
+    }
+
+
+def automation_task_board_status() -> dict[str, Any]:
+    status = automation_status()
+    return {
+        **(status.get("task_board") or {}),
+        "action_history": read_automation_task_actions(12),
+        "readiness": status.get("readiness"),
+        "policy": status.get("policy"),
+        "stage": (status.get("readiness") or {}).get("stage") if isinstance(status.get("readiness"), dict) else None,
+        "state": status.get("state"),
+        "updated_at": now_iso(),
+    }
+
+
+def automation_consider_preflight(scan: dict[str, Any] | None, params: dict[str, Any], *, source: str = "paper_loop") -> dict[str, Any]:
+    scan = scan or {}
+    inst_id = params.get("instId") or params.get("inst_id") or scan.get("inst_id")
+    bar = params.get("bar")
+    signal_summary = automation_scan_summary(scan, inst_id, bar)
+    signal_hash = signal_summary["hash"]
+    ready = bool(scan.get("status") == "ready" and scan.get("position"))
+    with AUTOMATION_LOCK:
+        state = load_automation_state()
+        if not ready:
+            state = save_automation_state(
+                {
+                    **state,
+                    "state": "waiting_ready_signal",
+                    "last_signal_hash": signal_hash,
+                    "last_signal": signal_summary,
+                    "last_error": None,
+                }
+            )
+            return state
+        if state.get("last_preflight_hash") == signal_hash:
+            state = save_automation_state(
+                {
+                    **state,
+                    "state": "preflight_current",
+                    "last_signal_hash": signal_hash,
+                    "last_signal": signal_summary,
+                    "last_error": None,
+                }
+            )
+            return state
+        state = save_automation_state(
+            {
+                **state,
+                "state": "preflight_running",
+                "last_signal_hash": signal_hash,
+                "last_signal": signal_summary,
+                "last_error": None,
+            }
+        )
+    try:
+        result = execution_dry_run(
+            {
+                **params,
+                "instId": inst_id,
+                "bar": bar,
+                "automation_preflight": True,
+                "automation_source": source,
+                "automation_signal_hash": signal_hash,
+            }
+        )
+        summary = automation_result_summary(result)
+        state_name = "preflight_passed" if summary.get("allow_dry_run") else "preflight_blocked"
+        with AUTOMATION_LOCK:
+            current = load_automation_state()
+            state = save_automation_state(
+                {
+                    **current,
+                    "state": state_name,
+                    "last_signal_hash": signal_hash,
+                    "last_preflight_hash": signal_hash,
+                    "last_signal": signal_summary,
+                    "last_preflight": summary,
+                    "last_error": None,
+                }
+            )
+        append_automation_preflight_history(
+            source=source,
+            state=state_name,
+            signal_hash=signal_hash,
+            signal=signal_summary,
+            summary=summary,
+        )
+        append_paper_audit(
+            {
+                "action": "automation_preflight",
+                "inst_id": inst_id,
+                "bar": bar,
+                "strategy_mode": params.get("strategy_mode"),
+                "params": audit_params(params),
+                "automation": {
+                    "source": source,
+                    "signal_hash": signal_hash,
+                    "state": state_name,
+                },
+                "order_intent": result.get("order_intent"),
+                "intent_fingerprint": result.get("intent_fingerprint"),
+                "execution_guard": result.get("guard"),
+                "final_gate": result.get("final_gate"),
+                "data_quality": result.get("data_quality"),
+                "okx_order": result.get("okx_order"),
+                "shadow_order": result.get("shadow_order"),
+                "scan_signature": signal_summary.get("signature"),
+                "actions": [{"type": "automation_preflight", "decision": summary.get("guard_decision")}],
+            }
+        )
+        append_paper_event("automation_preflight", {"signal_hash": signal_hash, "state": state_name, "guard": summary.get("guard_decision")})
+        return state
+    except Exception as exc:
+        with AUTOMATION_LOCK:
+            current = load_automation_state()
+            state = save_automation_state(
+                {
+                    **current,
+                    "state": "preflight_error",
+                    "last_signal_hash": signal_hash,
+                    "last_signal": signal_summary,
+                    "last_error": str(exc),
+                }
+            )
+        append_automation_preflight_history(
+            source=source,
+            state="preflight_error",
+            signal_hash=signal_hash,
+            signal=signal_summary,
+            error=str(exc),
+        )
+        append_paper_event("automation_preflight_error", {"signal_hash": signal_hash, "error": str(exc)})
+        return state
+
+
+def automation_run_manual_preflight(params: dict[str, Any] | None = None) -> dict[str, Any]:
+    params = params or {}
+    with paper_lock:
+        snapshot = paper_state_payload(paper_state)
+    latest_scan = (snapshot.get("signal_log") or [{}])[0] or {}
+    inst_id = params.get("instId") or params.get("inst_id") or snapshot.get("inst_id") or "BTC-USDT-SWAP"
+    bar = params.get("bar") or snapshot.get("bar") or "15m"
+    run_params = audit_params(
+        {
+            **(snapshot.get("params") or {}),
+            **params,
+            "instId": inst_id,
+            "bar": bar,
+            "strategy_mode": params.get("strategy_mode") or snapshot.get("strategy_mode"),
+            "automation_preflight": True,
+            "automation_source": params.get("automation_source") or "manual",
+        }
+    )
+    signal_summary = automation_scan_summary(latest_scan, inst_id, bar)
+    signal_hash = signal_summary["hash"]
+    with AUTOMATION_LOCK:
+        current = load_automation_state()
+        save_automation_state(
+            {
+                **current,
+                "state": "manual_preflight_running",
+                "last_signal_hash": signal_hash,
+                "last_signal": signal_summary,
+                "last_error": None,
+            }
+        )
+    try:
+        result = execution_dry_run({**run_params, "automation_signal_hash": signal_hash})
+        summary = automation_result_summary(result)
+        state_name = "manual_preflight_passed" if summary.get("allow_dry_run") else "manual_preflight_blocked"
+        with AUTOMATION_LOCK:
+            current = load_automation_state()
+            state = save_automation_state(
+                {
+                    **current,
+                    "state": state_name,
+                    "last_signal_hash": signal_hash,
+                    "last_preflight_hash": signal_hash,
+                    "last_signal": signal_summary,
+                    "last_preflight": summary,
+                    "last_error": None,
+                }
+            )
+        append_automation_preflight_history(
+            source="manual",
+            state=state_name,
+            signal_hash=signal_hash,
+            signal=signal_summary,
+            summary=summary,
+        )
+        append_paper_audit(
+            {
+                "action": "automation_manual_preflight",
+                "inst_id": inst_id,
+                "bar": bar,
+                "strategy_mode": run_params.get("strategy_mode"),
+                "params": run_params,
+                "automation": {
+                    "source": "manual",
+                    "signal_hash": signal_hash,
+                    "state": state_name,
+                },
+                "order_intent": result.get("order_intent"),
+                "intent_fingerprint": result.get("intent_fingerprint"),
+                "execution_guard": result.get("guard"),
+                "final_gate": result.get("final_gate"),
+                "data_quality": result.get("data_quality"),
+                "okx_order": result.get("okx_order"),
+                "shadow_order": result.get("shadow_order"),
+                "scan_signature": signal_summary.get("signature"),
+                "actions": [{"type": "automation_manual_preflight", "decision": summary.get("guard_decision")}],
+            }
+        )
+        append_paper_event("automation_manual_preflight", {"signal_hash": signal_hash, "state": state_name, "guard": summary.get("guard_decision")})
+        return {
+            "ok": True,
+            "state": state,
+            "automation": automation_status(),
+            "dry_run": result,
+            "summary": summary,
+        }
+    except Exception as exc:
+        with AUTOMATION_LOCK:
+            current = load_automation_state()
+            state = save_automation_state(
+                {
+                    **current,
+                    "state": "manual_preflight_error",
+                    "last_signal_hash": signal_hash,
+                    "last_signal": signal_summary,
+                    "last_error": str(exc),
+                }
+            )
+        append_automation_preflight_history(
+            source="manual",
+            state="manual_preflight_error",
+            signal_hash=signal_hash,
+            signal=signal_summary,
+            error=str(exc),
+        )
+        append_paper_event("automation_manual_preflight_error", {"signal_hash": signal_hash, "error": str(exc)})
+        return {"ok": False, "state": state, "automation": automation_status(), "error": str(exc)}
+
+
 def execution_config() -> dict[str, Any]:
     okx_keys = {key: bool(os.environ.get(key)) for key in OKX_ENV_KEYS}
     okx_status = okx_credentials_status()
+    keychain_status = okx_keychain_status()
+    connector = okx_connector_status()
     return {
         "live_trading_enabled": LIVE_TRADING_ENABLED,
+        "live_order_enabled": OKX_LIVE_ORDER_ENABLED,
+        "live_cancel_enabled": OKX_LIVE_CANCEL_ENABLED,
+        "dry_run_only": bool(connector.get("dry_run_only")),
+        "can_submit_live": bool(connector.get("can_submit_live")),
+        "can_cancel_live": bool(connector.get("can_cancel_live")),
         "okx_configured": all(okx_keys.values()),
         "okx_keys": okx_keys,
         "okx_base_url": OKX_API_BASE_URL,
+        "okx_keychain_service": OKX_KEYCHAIN_SERVICE,
+        "okx_keychain_supported": okx_keychain_available(),
+        "okx_keychain": keychain_status,
         "okx_simulated": okx_status["simulated"],
         "readonly_ready": okx_status["configured"],
-        "connector": "not_configured",
-        "live_submit_available": False,
+        "connector": connector["name"],
+        "connector_status": connector,
+        "live_submit_available": bool(connector.get("can_submit_live")),
         "confirmation_phrase": "CONFIRM_LIVE_TRADE",
         "notes": [
             "真实下单默认关闭。",
-            "当前版本只允许 dry-run 和锁测试，不会发送 OKX 订单。",
+            "真实下单需要同时开启 LIVE_TRADING_ENABLED=true 与 OKX_LIVE_ORDER_ENABLED=true。",
+            "未满足双环境锁、确认短语和最终门槛时，只会生成 dry-run、签名请求预览和锁测试。",
         ],
     }
 
@@ -3459,6 +5279,90 @@ def okx_credentials_status() -> dict[str, Any]:
         "keys": keys,
         "base_url": OKX_API_BASE_URL,
         "simulated": os.environ.get("OKX_API_SIMULATED", "").lower() in {"1", "true", "yes", "on"},
+        "keychain_service": OKX_KEYCHAIN_SERVICE,
+    }
+
+
+def okx_keychain_available() -> bool:
+    return Path("/usr/bin/security").exists()
+
+
+def okx_keychain_get(account: str) -> str:
+    if not okx_keychain_available():
+        return ""
+    result = subprocess.run(
+        ["/usr/bin/security", "find-generic-password", "-s", OKX_KEYCHAIN_SERVICE, "-a", account, "-w"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def okx_keychain_status() -> dict[str, Any]:
+    supported = okx_keychain_available()
+    keys = {key: bool(okx_keychain_get(key)) if supported else False for key in OKX_ENV_KEYS}
+    return {
+        "supported": supported,
+        "configured": all(keys.values()),
+        "keys": keys,
+        "service": OKX_KEYCHAIN_SERVICE,
+    }
+
+
+def okx_keychain_set(account: str, value: str) -> None:
+    if not okx_keychain_available():
+        raise RuntimeError("macOS security command not available")
+    subprocess.run(
+        ["/usr/bin/security", "add-generic-password", "-s", OKX_KEYCHAIN_SERVICE, "-a", account, "-w", value, "-U"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=True,
+    )
+
+
+def load_okx_credentials_from_keychain() -> dict[str, Any]:
+    if all(os.environ.get(key) for key in OKX_ENV_KEYS):
+        return {"loaded": False, "reason": "env_already_configured"}
+    loaded: list[str] = []
+    for key in OKX_ENV_KEYS:
+        if os.environ.get(key):
+            loaded.append(key)
+            continue
+        value = okx_keychain_get(key)
+        if value:
+            os.environ[key] = value
+            loaded.append(key)
+    return {
+        "loaded": all(os.environ.get(key) for key in OKX_ENV_KEYS),
+        "keys": {key: bool(os.environ.get(key)) for key in OKX_ENV_KEYS},
+        "loaded_keys": loaded,
+        "service": OKX_KEYCHAIN_SERVICE,
+    }
+
+
+def persist_okx_credentials_to_keychain(values: dict[str, str]) -> dict[str, Any]:
+    written: list[str] = []
+    errors: dict[str, str] = {}
+    for key in OKX_ENV_KEYS:
+        value = values.get(key, "")
+        if not value:
+            continue
+        try:
+            okx_keychain_set(key, value)
+            written.append(key)
+        except Exception as exc:
+            errors[key] = str(exc)
+    verified_keys = {key: bool(okx_keychain_get(key)) for key in OKX_ENV_KEYS} if okx_keychain_available() else {key: False for key in OKX_ENV_KEYS}
+    verified = all(verified_keys.values())
+    return {
+        "ok": not errors and len(written) == len(OKX_ENV_KEYS) and verified,
+        "written_keys": written,
+        "verified": verified,
+        "verified_keys": verified_keys,
+        "errors": errors,
+        "service": OKX_KEYCHAIN_SERVICE,
     }
 
 
@@ -3475,18 +5379,374 @@ def set_okx_session_credentials(payload: dict[str, Any]) -> dict[str, Any]:
             "configured": False,
             "error": f"missing fields: {', '.join(missing)}",
             "status": okx_credentials_status(),
+            "persist_requested": bool(payload.get("persist_to_keychain")),
+            "restart_survives": False,
+            "next_action": "补齐 OKX_API_KEY、OKX_API_SECRET、OKX_API_PASSPHRASE 后重新保存。",
         }
     for key, value in values.items():
         os.environ[key] = value
     if "simulated" in payload:
         os.environ["OKX_API_SIMULATED"] = "1" if bool(payload.get("simulated")) else ""
+    persist_to_keychain = bool(payload.get("persist_to_keychain"))
+    keychain_result = persist_okx_credentials_to_keychain(values) if persist_to_keychain else {
+        "ok": False,
+        "written_keys": [],
+        "verified": False,
+        "verified_keys": {key: False for key in OKX_ENV_KEYS},
+        "errors": {},
+        "service": OKX_KEYCHAIN_SERVICE,
+        "skipped": True,
+    }
     return {
         "ok": True,
         "configured": True,
         "status": okx_credentials_status(),
-        "scope": "current_backend_process_only",
+        "scope": "keychain_and_current_backend_process" if keychain_result.get("ok") else "current_backend_process_only",
+        "persist_requested": persist_to_keychain,
+        "restart_survives": bool(keychain_result.get("ok")),
+        "keychain": keychain_result,
+        "keychain_status": okx_keychain_status(),
+        "next_action": (
+            "Keychain 已读回确认；运行 OKX 诊断，通过后可进入只读实盘验证。"
+            if keychain_result.get("ok")
+            else "Keychain 未完成读回；重启后不会自动恢复。请重新保存或运行 python3 scripts/manage_24x7.py import-secrets --restart。"
+            if persist_to_keychain
+            else "本次只保存到当前后端进程；重启后会丢失。需要 7x24 恢复时请勾选 Keychain 保存。"
+        ),
         "updated_at": now_iso(),
     }
+
+
+def parse_env_file(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
+def redact_sensitive_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            lowered = str(key).lower()
+            if any(marker in lowered for marker in ("token", "password", "secret", "signature", "passphrase", "api_key", "apikey")):
+                redacted[key] = "<redacted>"
+            else:
+                redacted[key] = redact_sensitive_payload(item)
+        return redacted
+    if isinstance(value, list):
+        return [redact_sensitive_payload(item) for item in value]
+    if isinstance(value, str):
+        return redact_sensitive_text(value) or ""
+    return value
+
+
+def ai4trade_credentials_status() -> dict[str, Any]:
+    local_env = parse_env_file(AI4TRADE_ENV_FILE)
+    token = os.environ.get("AI4TRADE_TOKEN") or local_env.get("AI4TRADE_TOKEN") or ""
+    agent_id = os.environ.get("AI4TRADE_AGENT_ID") or local_env.get("AI4TRADE_AGENT_ID") or ""
+    agent_name = os.environ.get("AI4TRADE_AGENT_NAME") or local_env.get("AI4TRADE_AGENT_NAME") or ""
+    email = os.environ.get("AI4TRADE_EMAIL") or local_env.get("AI4TRADE_EMAIL") or ""
+    return {
+        "configured": bool(token),
+        "base_url": AI4TRADE_API_BASE_URL,
+        "env_file": str(AI4TRADE_ENV_FILE),
+        "env_file_present": AI4TRADE_ENV_FILE.exists(),
+        "agent_id": agent_id,
+        "agent_name": agent_name,
+        "email": email,
+        "token_present": bool(token),
+        "token_redacted": redacted_key(token) if token else "",
+        "_token": token,
+    }
+
+
+def ai4trade_safe_path_allowed(method: str, request_path: str) -> bool:
+    parsed = urllib.parse.urlparse(request_path)
+    if method.upper() == "GET":
+        return parsed.path in AI4TRADE_SAFE_GET_PATHS
+    if method.upper() == "POST":
+        return parsed.path in AI4TRADE_SAFE_POST_PATHS
+    return False
+
+
+def ai4trade_request(method: str, request_path: str, payload: dict[str, Any] | None = None, *, require_auth: bool = False) -> dict[str, Any]:
+    method = method.upper()
+    if not request_path.startswith("/"):
+        request_path = f"/{request_path}"
+    status = ai4trade_credentials_status()
+    parsed = urllib.parse.urlparse(request_path)
+    if not ai4trade_safe_path_allowed(method, request_path):
+        return {
+            "ok": False,
+            "configured": bool(status.get("configured")),
+            "category": "locked_path",
+            "error": f"AI4Trade path is locked by local read-only policy: {method} {parsed.path}",
+            "readonly_policy": "Only signal feed, market-intel, agent info, and heartbeat are allowed. No follow, publish, challenge trade, or copy-trade calls.",
+        }
+    if require_auth and not status.get("configured"):
+        return {
+            "ok": False,
+            "configured": False,
+            "category": "missing_credentials",
+            "error": "AI4Trade token is not configured",
+            "credentials": {key: value for key, value in status.items() if key != "_token"},
+        }
+
+    headers = {
+        "User-Agent": "okx-perp-bot-ai4trade-readonly/0.1",
+        "Accept": "application/json",
+    }
+    token = str(status.get("_token") or "")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    body = None
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    url = f"{AI4TRADE_API_BASE_URL}{request_path}"
+    request = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=AI4TRADE_TIMEOUT_SECONDS) as response:
+            text = response.read().decode("utf-8")
+            parsed_payload = json.loads(text) if text else {}
+            return {
+                "ok": 200 <= response.status < 300,
+                "configured": bool(status.get("configured")),
+                "http_status": response.status,
+                "request_path": request_path,
+                "payload": redact_sensitive_payload(parsed_payload),
+                "updated_at": now_iso(),
+            }
+    except urllib.error.HTTPError as exc:
+        text = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed_payload = json.loads(text) if text else {}
+        except json.JSONDecodeError:
+            parsed_payload = {"raw": text}
+        return {
+            "ok": False,
+            "configured": bool(status.get("configured")),
+            "http_status": exc.code,
+            "request_path": request_path,
+            "category": "remote_rejected",
+            "error": str(exc),
+            "payload": redact_sensitive_payload(parsed_payload),
+            "updated_at": now_iso(),
+        }
+    except (TimeoutError, urllib.error.URLError, socket.timeout) as exc:
+        return {
+            "ok": False,
+            "configured": bool(status.get("configured")),
+            "request_path": request_path,
+            "category": "network_error",
+            "error": str(exc),
+            "updated_at": now_iso(),
+        }
+
+
+def ai4trade_signal_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    rows = payload.get("signals") or payload.get("rows") or []
+    if not isinstance(rows, list):
+        rows = []
+    symbols: dict[str, int] = {}
+    types: dict[str, int] = {}
+    agents: dict[str, int] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        symbol = str(row.get("symbol") or row.get("market") or "unknown")
+        msg_type = str(row.get("message_type") or row.get("type") or "unknown")
+        agent = str(row.get("agent_name") or row.get("author_name") or row.get("agent_id") or "unknown")
+        symbols[symbol] = symbols.get(symbol, 0) + 1
+        types[msg_type] = types.get(msg_type, 0) + 1
+        agents[agent] = agents.get(agent, 0) + 1
+    return {
+        "count": len(rows),
+        "symbols": sorted(symbols.items(), key=lambda item: item[1], reverse=True)[:8],
+        "types": sorted(types.items(), key=lambda item: item[1], reverse=True)[:8],
+        "agents": sorted(agents.items(), key=lambda item: item[1], reverse=True)[:8],
+    }
+
+
+def ai4trade_history_entry(result: dict[str, Any]) -> dict[str, Any]:
+    heartbeat = result.get("heartbeat") if isinstance(result.get("heartbeat"), dict) else {}
+    signals = result.get("signals") if isinstance(result.get("signals"), dict) else {}
+    market_intel = result.get("market_intel") if isinstance(result.get("market_intel"), dict) else {}
+    policy = result.get("policy") if isinstance(result.get("policy"), dict) else {}
+    credentials = result.get("credentials") if isinstance(result.get("credentials"), dict) else {}
+    return {
+        "time": result.get("updated_at") or now_iso(),
+        "ok": bool(result.get("ok")),
+        "configured": bool(result.get("configured")),
+        "agent": {
+            "id": credentials.get("agent_id"),
+            "name": credentials.get("agent_name"),
+            "token_present": bool(credentials.get("token_present")),
+        },
+        "heartbeat": {
+            "ok": bool(heartbeat.get("ok")),
+            "http_status": heartbeat.get("http_status"),
+            "message_count": int(heartbeat.get("message_count") or 0),
+            "task_count": int(heartbeat.get("task_count") or 0),
+            "category": heartbeat.get("category"),
+            "error": redact_sensitive_text(str(heartbeat.get("error") or "")) or "",
+        },
+        "signals": {
+            "ok": bool(signals.get("ok")),
+            "http_status": signals.get("http_status"),
+            "summary": signals.get("summary") if isinstance(signals.get("summary"), dict) else {},
+            "category": signals.get("category"),
+            "error": redact_sensitive_text(str(signals.get("error") or "")) or "",
+        },
+        "market_intel": {
+            "overview_ok": bool(market_intel.get("overview_ok")),
+            "news_ok": bool(market_intel.get("news_ok")),
+            "category": market_intel.get("category"),
+            "error": redact_sensitive_text(str(market_intel.get("error") or "")) or "",
+        },
+        "policy": {
+            "trade_endpoints_locked": True,
+            "copy_trade_locked": bool(policy.get("copy_trade_locked", True)),
+            "publish_locked": bool(policy.get("publish_locked", True)),
+            "execution_allowed": bool(policy.get("execution_allowed", False)),
+            "okx_bridge": policy.get("okx_bridge"),
+        },
+        "next_action": result.get("next_action"),
+    }
+
+
+def append_ai4trade_history(result: dict[str, Any]) -> dict[str, Any]:
+    entry = ai4trade_history_entry(result)
+    CACHE_DIR.mkdir(exist_ok=True)
+    with AI4TRADE_HISTORY_LOCK:
+        with AI4TRADE_HISTORY_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return entry
+
+
+def read_ai4trade_history(limit: int = 50) -> dict[str, Any]:
+    if not AI4TRADE_HISTORY_FILE.exists():
+        return {"path": str(AI4TRADE_HISTORY_FILE), "rows": [], "count": 0}
+    rows = []
+    with AI4TRADE_HISTORY_LOCK:
+        lines = AI4TRADE_HISTORY_FILE.read_text(encoding="utf-8").splitlines()[-max(1, min(limit, 500)) :]
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    rows = list(reversed(rows))
+    return {"path": str(AI4TRADE_HISTORY_FILE), "rows": rows, "count": len(rows), "latest": rows[0] if rows else None}
+
+
+def read_readiness_snapshot_history(limit: int = 50) -> dict[str, Any]:
+    if not READINESS_SNAPSHOT_FILE.exists():
+        return {"path": str(READINESS_SNAPSHOT_FILE), "rows": [], "count": 0}
+    rows = []
+    with READINESS_SNAPSHOT_LOCK:
+        lines = READINESS_SNAPSHOT_FILE.read_text(encoding="utf-8").splitlines()
+    for line in lines[-max(1, min(limit, 500)) :]:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            rows.append(redact_sensitive_payload(row))
+    rows = list(reversed(rows))
+    latest = rows[0] if rows else None
+    return {"path": str(READINESS_SNAPSHOT_FILE), "rows": rows, "count": len(lines), "latest": latest}
+
+
+def ai4trade_status_finalize(result: dict[str, Any]) -> dict[str, Any]:
+    append_ai4trade_history(result)
+    return {**result, "history": read_ai4trade_history(8)}
+
+
+def ai4trade_status(params: dict[str, Any] | None = None) -> dict[str, Any]:
+    params = params or {}
+    signal_limit = max(1, min(50, int(params.get("signals_limit") or 12)))
+    news_limit = max(1, min(12, int(params.get("news_limit") or 4)))
+    news_category = str(params.get("category") or "crypto")
+    status = ai4trade_credentials_status()
+    public_policy = {
+        "mode": "read_only_signal_context",
+        "execution_allowed": False,
+        "trade_endpoints_locked": True,
+        "copy_trade_locked": True,
+        "publish_locked": True,
+        "allowed_get_paths": list(AI4TRADE_SAFE_GET_PATHS),
+        "allowed_post_paths": list(AI4TRADE_SAFE_POST_PATHS),
+        "okx_bridge": "disabled; AI4Trade can only annotate signals and market context.",
+    }
+    agent = ai4trade_request("GET", "/claw/agents/me", require_auth=True)
+    heartbeat_payload = {
+        "agent_id": int(status["agent_id"]) if str(status.get("agent_id") or "").isdigit() else status.get("agent_id"),
+        "status": "alive",
+        "capabilities": ["read-only-signal-context", "okx-dry-run-gate"],
+    }
+    heartbeat = ai4trade_request("POST", "/claw/agents/heartbeat", heartbeat_payload, require_auth=True)
+    signals = ai4trade_request("GET", f"/signals/feed?{urllib.parse.urlencode({'limit': signal_limit})}")
+    intel_overview = ai4trade_request("GET", "/market-intel/overview")
+    intel_news = ai4trade_request("GET", f"/market-intel/news?{urllib.parse.urlencode({'category': news_category, 'limit': news_limit})}")
+    signal_payload = signals.get("payload") if isinstance(signals.get("payload"), dict) else {}
+    heartbeat_payload_out = heartbeat.get("payload") if isinstance(heartbeat.get("payload"), dict) else {}
+    overview_payload = intel_overview.get("payload") if isinstance(intel_overview.get("payload"), dict) else {}
+    news_payload = intel_news.get("payload") if isinstance(intel_news.get("payload"), dict) else {}
+    ok = bool(signals.get("ok") or intel_overview.get("ok") or intel_news.get("ok") or heartbeat.get("ok"))
+    return ai4trade_status_finalize({
+        "ok": ok,
+        "configured": bool(status.get("configured")),
+        "credentials": {key: value for key, value in status.items() if key != "_token"},
+        "policy": public_policy,
+        "agent": agent,
+        "heartbeat": {
+            "ok": bool(heartbeat.get("ok")),
+            "http_status": heartbeat.get("http_status"),
+            "message_count": heartbeat_payload_out.get("message_count", len(heartbeat_payload_out.get("messages") or [])),
+            "task_count": heartbeat_payload_out.get("task_count", len(heartbeat_payload_out.get("tasks") or [])),
+            "has_more_messages": heartbeat_payload_out.get("has_more_messages"),
+            "has_more_tasks": heartbeat_payload_out.get("has_more_tasks"),
+            "recommended_poll_interval_seconds": heartbeat_payload_out.get("recommended_poll_interval_seconds"),
+            "messages": (heartbeat_payload_out.get("messages") or [])[:5],
+            "tasks": (heartbeat_payload_out.get("tasks") or [])[:5],
+            "error": heartbeat.get("error"),
+            "category": heartbeat.get("category"),
+            "updated_at": heartbeat.get("updated_at"),
+        },
+        "signals": {
+            "ok": bool(signals.get("ok")),
+            "http_status": signals.get("http_status"),
+            "summary": ai4trade_signal_summary(signal_payload),
+            "rows": (signal_payload.get("signals") or signal_payload.get("rows") or [])[:signal_limit],
+            "error": signals.get("error"),
+            "category": signals.get("category"),
+            "updated_at": signals.get("updated_at"),
+        },
+        "market_intel": {
+            "overview_ok": bool(intel_overview.get("ok")),
+            "news_ok": bool(intel_news.get("ok")),
+            "overview": overview_payload,
+            "news": news_payload,
+            "category": news_category,
+            "error": intel_overview.get("error") or intel_news.get("error"),
+            "updated_at": intel_overview.get("updated_at") or intel_news.get("updated_at"),
+        },
+        "next_action": (
+            "AI4Trade 只读信号源可用；仅允许进入人工评估和 dry-run 注释。"
+            if ok else
+            "AI4Trade 当前不可用；保持 OKX 策略和实盘锁独立运行。"
+        ),
+        "updated_at": now_iso(),
+    })
 
 
 def okx_timestamp() -> str:
@@ -3500,13 +5760,409 @@ def okx_sign(timestamp: str, method: str, request_path: str, body: str = "") -> 
     return base64.b64encode(digest).decode("utf-8")
 
 
-def okx_get(request_path: str) -> dict[str, Any]:
+def okx_json_body(payload: dict[str, Any] | None = None) -> str:
+    if payload is None:
+        return ""
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def redacted_key(value: str | None) -> str:
+    if not value:
+        return ""
+    return f"***{value[-4:]}" if len(value) > 4 else "***"
+
+
+def okx_private_request_preview(method: str, request_path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    method = method.upper()
+    body = okx_json_body(payload) if method != "GET" else ""
+    timestamp = okx_timestamp()
+    status = okx_credentials_status()
+    signature = okx_sign(timestamp, method, request_path, body) if status.get("configured") else ""
+    return {
+        "ok": bool(status.get("configured")),
+        "configured": bool(status.get("configured")),
+        "method": method,
+        "request_path": request_path,
+        "body": payload or {},
+        "body_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest() if body else None,
+        "headers": {
+            "OK-ACCESS-KEY": redacted_key(os.environ.get("OKX_API_KEY")),
+            "OK-ACCESS-SIGN": redacted_key(signature),
+            "OK-ACCESS-TIMESTAMP": timestamp,
+            "OK-ACCESS-PASSPHRASE": "***" if os.environ.get("OKX_API_PASSPHRASE") else "",
+            "x-simulated-trading": "1" if status.get("simulated") else None,
+        },
+        "signature_ready": bool(signature),
+        "dry_run_only": True,
+        "readonly_allowed": okx_private_request_is_readonly(method, request_path),
+        "network_policy": "GET-only private read validation" if method == "GET" else "preview-only; network disabled",
+    }
+
+
+def okx_private_request_is_readonly(method: str, request_path: str) -> bool:
+    if method.upper() != "GET":
+        return False
+    parsed = urllib.parse.urlparse(request_path)
+    return parsed.path in OKX_READONLY_PRIVATE_PATHS
+
+
+def okx_connector_status() -> dict[str, Any]:
+    status = okx_credentials_status()
+    can_submit_live = bool(status.get("configured") and LIVE_TRADING_ENABLED and OKX_LIVE_ORDER_ENABLED)
+    can_cancel_live = bool(status.get("configured") and LIVE_TRADING_ENABLED and OKX_LIVE_CANCEL_ENABLED)
+    return {
+        "name": "okx_safe_adapter",
+        "configured": bool(status.get("configured")),
+        "simulated": bool(status.get("simulated")),
+        "live_trading_enabled": LIVE_TRADING_ENABLED,
+        "live_order_enabled": OKX_LIVE_ORDER_ENABLED,
+        "live_cancel_enabled": OKX_LIVE_CANCEL_ENABLED,
+        "dry_run_only": not can_submit_live,
+        "can_submit_live": can_submit_live,
+        "can_cancel_live": can_cancel_live,
+        "signature_ready": bool(status.get("configured")),
+        "readonly_private_paths": list(OKX_READONLY_PRIVATE_PATHS),
+        "live_order_path": OKX_LIVE_ORDER_PATH,
+        "live_cancel_path": OKX_LIVE_CANCEL_PATH,
+        "supported_actions": [
+            "readonly_account_config",
+            "readonly_balance",
+            "readonly_positions",
+            "readonly_order_query_preview",
+            "order_preview",
+            "live_order_submit" if can_submit_live else "live_order_submit_locked",
+            "status_reconcile",
+            "cancel_reconcile",
+            "fill_reconcile",
+        ],
+        "blocked_reason": (
+            "真实下单适配器已解锁；仍需最终门槛和确认短语。"
+            if can_submit_live else
+            "真实网络下单仍未开放；需要同时设置 LIVE_TRADING_ENABLED=true 与 OKX_LIVE_ORDER_ENABLED=true。"
+        ),
+        "updated_at": now_iso(),
+    }
+
+
+def okx_private_connector_health(diagnostics: dict[str, Any] | None = None) -> dict[str, Any]:
+    connector = okx_connector_status()
+    diagnostics = diagnostics or {}
+    steps = diagnostics.get("steps") or []
+    failed_steps = [step for step in steps if not step.get("ok")]
+    readonly_ok = bool(diagnostics.get("readonly_ok"))
+    configured = bool(connector.get("configured"))
+    category = diagnostics.get("category") or ("readonly_ok" if readonly_ok else "missing_credentials" if not configured else "not_checked")
+    read_only_previews = [
+        okx_private_request_preview("GET", "/api/v5/account/config"),
+        okx_private_request_preview("GET", "/api/v5/account/balance"),
+        okx_private_request_preview("GET", "/api/v5/account/positions?instType=SWAP"),
+        okx_private_request_preview("GET", "/api/v5/trade/order?instId=BTC-USDT-SWAP&clOrdId=readonly-validation"),
+    ]
+    order_preview = okx_private_request_preview("POST", "/api/v5/trade/order", {"dryRun": True})
+    health_score = 0
+    if configured:
+        health_score += 35
+    if all(item.get("signature_ready") for item in read_only_previews):
+        health_score += 25
+    if steps:
+        health_score += 15 if not failed_steps else 5
+    if readonly_ok:
+        health_score += 25
+    status = "pass" if readonly_ok else "pending" if configured and not steps else "fail"
+    if not configured:
+        status = "missing_credentials"
+    return {
+        "ok": readonly_ok,
+        "status": status,
+        "score": min(100, health_score),
+        "category": category,
+        "connector": connector,
+        "configured": configured,
+        "signature_ready": bool(connector.get("signature_ready")),
+        "readonly_ok": readonly_ok,
+        "dry_run_only": bool(connector.get("dry_run_only")),
+        "safe_to_query_private": configured,
+        "can_submit_live": bool(connector.get("can_submit_live")),
+        "trade_submit_locked": not bool(connector.get("can_submit_live")),
+        "failed_steps": failed_steps,
+        "steps_checked": [step.get("name") for step in steps],
+        "read_only_request_previews": read_only_previews,
+        "order_query_request_preview": read_only_previews[-1],
+        "order_request_preview": order_preview,
+        "blocked_reason": connector.get("blocked_reason"),
+        "next_action": (
+            "只读私有接口已通过；继续保持真实提交锁定，进入人工实盘观测。"
+            if readonly_ok else
+            (okx_diagnostic_actions(category)[0] if category else connector.get("blocked_reason"))
+        ),
+        "updated_at": now_iso(),
+    }
+
+
+def okx_private_request(method: str, request_path: str, payload: dict[str, Any] | None = None, *, timeout: int = 10) -> dict[str, Any]:
+    method = method.upper()
+    parsed = urllib.parse.urlparse(request_path)
+    request_preview = okx_private_request_preview(method, request_path, payload)
     status = okx_credentials_status()
     if not status["configured"]:
         return {
             "ok": False,
             "configured": False,
             "error": "OKX API credentials are not configured",
+            "category": "missing_credentials",
+            "request_preview": request_preview,
+            "config": status,
+        }
+
+    write_allowed = False
+    if method == "GET":
+        write_allowed = okx_private_request_is_readonly(method, request_path)
+    elif method == "POST" and parsed.path == OKX_LIVE_ORDER_PATH:
+        write_allowed = bool(LIVE_TRADING_ENABLED and OKX_LIVE_ORDER_ENABLED)
+    elif method == "POST" and parsed.path == OKX_LIVE_CANCEL_PATH:
+        write_allowed = bool(LIVE_TRADING_ENABLED and OKX_LIVE_CANCEL_ENABLED)
+
+    if not write_allowed:
+        return {
+            "ok": False,
+            "configured": True,
+            "error": f"private path is locked by local policy: {method} {parsed.path}",
+            "category": "unsupported_private_path",
+            "request_preview": request_preview,
+            "config": status,
+            "local_policy": {
+                "live_trading_enabled": LIVE_TRADING_ENABLED,
+                "live_order_enabled": OKX_LIVE_ORDER_ENABLED,
+                "live_cancel_enabled": OKX_LIVE_CANCEL_ENABLED,
+            },
+        }
+
+    body = okx_json_body(payload) if method != "GET" else ""
+    body_bytes = body.encode("utf-8") if body else None
+    if method == "POST":
+        request_preview = {
+            **request_preview,
+            "dry_run_only": False,
+            "network_policy": "live network request allowed by local policy locks",
+        }
+    timestamp = okx_timestamp()
+    headers = {
+        "OK-ACCESS-KEY": os.environ.get("OKX_API_KEY", ""),
+        "OK-ACCESS-SIGN": okx_sign(timestamp, method, request_path, body),
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": os.environ.get("OKX_API_PASSPHRASE", ""),
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": OKX_BROWSER_USER_AGENT,
+    }
+    if status.get("simulated"):
+        headers["x-simulated-trading"] = "1"
+    request = urllib.request.Request(f"{OKX_API_BASE_URL}{request_path}", data=body_bytes, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response_text = response.read().decode("utf-8")
+            response_payload = json.loads(response_text) if response_text else {}
+            status_code = response.status
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        try:
+            response_payload = json.loads(detail)
+        except Exception:
+            response_payload = {"msg": detail}
+        return {
+            "ok": False,
+            "configured": True,
+            "status_code": exc.code,
+            "payload": response_payload,
+            "error": f"HTTP {exc.code}: {response_payload.get('msg') or detail}",
+            "request_preview": request_preview,
+            "config": status,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "configured": True,
+            "error": str(exc),
+            "request_preview": request_preview,
+            "config": status,
+        }
+
+    ok = str(response_payload.get("code", "")) == "0"
+    return {
+        "ok": ok,
+        "configured": True,
+        "status_code": status_code,
+        "payload": response_payload,
+        "error": None if ok else response_payload.get("msg"),
+        "request_preview": request_preview,
+        "config": status,
+    }
+
+
+def okx_live_order_adapter_preview(okx_order: dict[str, Any], final_gate: dict[str, Any], confirmation: str) -> dict[str, Any]:
+    payload = okx_order.get("payload") if isinstance(okx_order, dict) else {}
+    request = okx_private_request_preview("POST", "/api/v5/trade/order", payload if isinstance(payload, dict) else {})
+    connector = okx_connector_status()
+    connector_health = okx_private_connector_health()
+    can_attempt_live = bool(
+        connector.get("can_submit_live")
+        and request.get("ok")
+        and okx_order.get("ok")
+        and final_gate.get("allow_submit")
+        and confirmation == "CONFIRM_LIVE_TRADE"
+    )
+    blocked = [
+        reason
+        for reason in [
+            None if final_gate.get("allow_submit") else "最终提交门槛未到达可提交状态。",
+            None if confirmation == "CONFIRM_LIVE_TRADE" else "确认短语未匹配。",
+            None if connector.get("can_submit_live") else connector.get("blocked_reason"),
+        ]
+        if reason
+    ]
+    if can_attempt_live:
+        response = okx_private_request("POST", "/api/v5/trade/order", payload if isinstance(payload, dict) else {})
+        rows = (response.get("payload") or {}).get("data") or []
+        first = rows[0] if rows else {}
+        accepted = bool(response.get("ok") and (not first or str(first.get("sCode", "0")) == "0"))
+        return {
+            "ok": accepted,
+            "submitted": accepted,
+            "mode": "live_submit",
+            "connector": connector,
+            "connector_health": connector_health,
+            "request_preview": response.get("request_preview", request),
+            "okx_response": response.get("payload"),
+            "exchange_order_id": first.get("ordId") or first.get("ord_id"),
+            "client_order_id": first.get("clOrdId") or payload.get("clOrdId"),
+            "response_code": (response.get("payload") or {}).get("code"),
+            "response_message": first.get("sMsg") or response.get("error"),
+            "blocked_reasons": [] if accepted else [first.get("sMsg") or response.get("error") or "OKX 未接受订单。"],
+            "next_action": "订单已被 OKX 接受，立即进入订单查询/撤单保护跟踪。" if accepted else "OKX 未接受订单，保留审计并停止继续提交。",
+        }
+    return {
+        "ok": False,
+        "submitted": False,
+        "mode": "dry_run_adapter",
+        "connector": connector,
+        "connector_health": connector_health,
+        "request_preview": request,
+        "blocked_reasons": blocked,
+        "next_action": "保持 dry-run；满足双环境锁、确认短语和最终门槛后才会真实提交。",
+    }
+
+
+def payload_sha256(payload: Any) -> str | None:
+    if not payload:
+        return None
+    try:
+        body = stable_json(payload)
+    except TypeError:
+        body = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def okx_shadow_order_evidence(
+    okx_order: dict[str, Any] | None,
+    final_gate: dict[str, Any] | None,
+    *,
+    canary_order: dict[str, Any] | None = None,
+    connector_attempt: dict[str, Any] | None = None,
+    submit_mode: str = "standard",
+    source: str = "dry_run",
+) -> dict[str, Any]:
+    okx_order = okx_order if isinstance(okx_order, dict) else {}
+    final_gate = final_gate if isinstance(final_gate, dict) else {}
+    canary_order = canary_order if isinstance(canary_order, dict) else {}
+    connector_attempt = connector_attempt if isinstance(connector_attempt, dict) else {}
+    payload = okx_order.get("payload") if isinstance(okx_order.get("payload"), dict) else {}
+    canary_okx_order = canary_order.get("okx_order") if isinstance(canary_order.get("okx_order"), dict) else {}
+    canary_payload = canary_okx_order.get("payload") if isinstance(canary_okx_order.get("payload"), dict) else {}
+    request_preview = connector_attempt.get("request_preview")
+    if not isinstance(request_preview, dict):
+        request_preview = okx_private_request_preview("POST", OKX_LIVE_ORDER_PATH, payload)
+    connector = connector_attempt.get("connector") if isinstance(connector_attempt.get("connector"), dict) else okx_connector_status()
+    blocked_reasons = connector_attempt.get("blocked_reasons") if isinstance(connector_attempt.get("blocked_reasons"), list) else []
+    if not blocked_reasons:
+        blocked_reasons = final_gate.get("blocked_reasons") if isinstance(final_gate.get("blocked_reasons"), list) else []
+    if not blocked_reasons and connector.get("blocked_reason"):
+        blocked_reasons = [connector.get("blocked_reason")]
+    checks = final_gate.get("checks") if isinstance(final_gate.get("checks"), list) else []
+    live_locks = [
+        {
+            "name": row.get("name"),
+            "action": row.get("action"),
+            "status": row.get("status"),
+        }
+        for row in checks
+        if isinstance(row, dict) and row.get("severity") == "live_lock" and not row.get("passed")
+    ]
+    return {
+        "type": "shadow_live_order",
+        "source": source,
+        "submit_mode": submit_mode,
+        "would_submit": False,
+        "submitted": False,
+        "dry_run_only": not bool(connector.get("can_submit_live")),
+        "can_submit_live": bool(connector.get("can_submit_live")),
+        "live_trading_enabled": bool(connector.get("live_trading_enabled")),
+        "live_order_enabled": bool(connector.get("live_order_enabled")),
+        "live_cancel_enabled": bool(connector.get("live_cancel_enabled")),
+        "trade_endpoint": "POST /api/v5/trade/order",
+        "inst_id": payload.get("instId"),
+        "client_order_id": payload.get("clOrdId"),
+        "payload_ready": bool(okx_order.get("ok")),
+        "payload_sha256": payload_sha256(payload),
+        "body_sha256": request_preview.get("body_sha256"),
+        "request_preview": request_preview,
+        "final_gate": {
+            "decision": final_gate.get("decision"),
+            "allow_submit": bool(final_gate.get("allow_submit")),
+            "ready_except_live_lock": bool(final_gate.get("ready_except_live_lock")),
+            "blocked_reasons": blocked_reasons,
+            "live_locks": live_locks,
+        },
+        "connector": {
+            "name": connector.get("name"),
+            "configured": bool(connector.get("configured")),
+            "signature_ready": bool(connector.get("signature_ready")),
+            "dry_run_only": not bool(connector.get("can_submit_live")),
+            "can_submit_live": bool(connector.get("can_submit_live")),
+            "can_cancel_live": bool(connector.get("can_cancel_live")),
+            "blocked_reason": connector.get("blocked_reason"),
+        },
+        "canary": {
+            "ok": bool(canary_order.get("ok")),
+            "status": canary_order.get("status"),
+            "target_notional": canary_order.get("target_notional"),
+            "client_order_id": canary_payload.get("clOrdId"),
+            "payload_sha256": payload_sha256(canary_payload),
+        } if canary_order else None,
+        "blocked_reason": blocked_reasons[0] if blocked_reasons else None,
+        "created_at": now_iso(),
+    }
+
+
+def okx_get(request_path: str) -> dict[str, Any]:
+    request_preview = okx_private_request_preview("GET", request_path)
+    if not request_preview.get("readonly_allowed"):
+        return {
+            "ok": False,
+            "configured": bool(okx_credentials_status().get("configured")),
+            "error": f"private path is not allowed in read-only validation mode: {urllib.parse.urlparse(request_path).path}",
+            "category": "unsupported_private_path",
+            "request_preview": request_preview,
+            "readonly_policy": "Only approved OKX GET account/trade-order query paths may reach the network.",
+            "config": okx_credentials_status(),
+        }
+    status = okx_credentials_status()
+    if not status["configured"]:
+        return {
+            "ok": False,
+            "configured": False,
+            "error": "OKX API credentials are not configured",
+            "category": "missing_credentials",
+            "request_preview": request_preview,
             "config": status,
         }
     timestamp = okx_timestamp()
@@ -3527,11 +6183,30 @@ def okx_get(request_path: str) -> dict[str, Any]:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        return {"ok": False, "configured": True, "error": f"HTTP {exc.code}: {detail}", "config": status}
+        return {
+            "ok": False,
+            "configured": True,
+            "error": f"HTTP {exc.code}: {detail}",
+            "request_preview": request_preview,
+            "config": status,
+        }
     except Exception as exc:
-        return {"ok": False, "configured": True, "error": str(exc), "config": status}
+        return {
+            "ok": False,
+            "configured": True,
+            "error": str(exc),
+            "request_preview": request_preview,
+            "config": status,
+        }
     ok = str(payload.get("code", "")) == "0"
-    return {"ok": ok, "configured": True, "payload": payload, "error": None if ok else payload.get("msg"), "config": status}
+    return {
+        "ok": ok,
+        "configured": True,
+        "payload": payload,
+        "error": None if ok else payload.get("msg"),
+        "request_preview": request_preview,
+        "config": status,
+    }
 
 
 def okx_public_get(request_path: str) -> dict[str, Any]:
@@ -3723,6 +6398,57 @@ def okx_order_payload_preview(
     }
 
 
+def canary_order_preview(
+    intent: dict[str, Any] | None,
+    instrument_rules: dict[str, Any],
+    params: dict[str, Any],
+    intent_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    if not intent:
+        return {"ok": False, "status": "no_intent", "message": "没有订单意图，无法生成 canary 预览。"}
+    original_notional = decimal_or_none(intent.get("notional"))
+    target_notional = decimal_or_none(params.get("canary_order_notional_usd"))
+    max_notional = decimal_or_none(params.get("max_live_order_notional_usd"))
+    if original_notional is None or original_notional <= 0:
+        return {"ok": False, "status": "invalid_notional", "message": "订单名义金额为空，无法缩放 canary。"}
+    if target_notional is None or target_notional <= 0:
+        return {"ok": False, "status": "invalid_canary_notional", "message": "canary_order_notional_usd 必须大于 0。"}
+    if max_notional is not None and max_notional > 0:
+        target_notional = min(target_notional, max_notional)
+    target_notional = min(target_notional, original_notional)
+    scale = target_notional / original_notional
+    canary_intent = dict(intent)
+    for key in ("qty", "notional", "margin_used", "planned_risk"):
+        value = decimal_or_none(canary_intent.get(key))
+        if value is not None:
+            canary_intent[key] = decimal_to_audit(value * scale, 10)
+    if canary_intent.get("id"):
+        canary_intent["id"] = f"{canary_intent['id']}-canary"
+    canary_intent["canary"] = True
+    canary_intent["scale_factor"] = decimal_to_audit(scale, 10)
+    canary_intent["target_notional"] = decimal_to_audit(target_notional, 10)
+    validation = okx_order_validation(canary_intent, instrument_rules)
+    payload = okx_order_payload_preview(
+        canary_intent,
+        validation,
+        params,
+        f"{intent_fingerprint or order_intent_fingerprint(intent) or 'manual'}c",
+    )
+    return {
+        "ok": bool(validation.get("ok") and payload.get("ok")),
+        "status": "ready" if validation.get("ok") and payload.get("ok") else validation.get("status") or payload.get("status"),
+        "mode": "canary_preview",
+        "dry_run_only": True,
+        "original_notional": decimal_to_audit(original_notional, 10),
+        "target_notional": decimal_to_audit(target_notional, 10),
+        "scale_factor": decimal_to_audit(scale, 10),
+        "intent": canary_intent,
+        "validation": validation,
+        "okx_order": payload,
+        "message": "Canary 小额订单 payload 预览已生成，当前不会真实提交。" if validation.get("ok") and payload.get("ok") else validation.get("message") or payload.get("message"),
+    }
+
+
 def okx_account_readonly() -> dict[str, Any]:
     result = okx_get("/api/v5/account/balance")
     if not result.get("ok"):
@@ -3734,6 +6460,8 @@ def okx_account_readonly() -> dict[str, Any]:
         "ok": True,
         "configured": True,
         "config": result.get("config"),
+        "request_preview": result.get("request_preview"),
+        "readonly_scope": "account_balance",
         "total_equity_usd": audit_number(account.get("totalEq"), 6),
         "adjusted_equity_usd": audit_number(account.get("adjEq"), 6),
         "isolated_equity_usd": audit_number(account.get("isoEq"), 6),
@@ -3793,6 +6521,8 @@ def okx_positions_readonly(params: dict[str, Any] | None = None) -> dict[str, An
         "ok": True,
         "configured": True,
         "config": result.get("config"),
+        "request_preview": result.get("request_preview"),
+        "readonly_scope": "account_positions",
         "positions": positions,
         "count": len(positions),
         "raw_count": len(rows),
@@ -3839,6 +6569,10 @@ def okx_diagnostic_actions(category: str) -> list[str]:
             "查看 OKX 返回码和错误信息。",
             "确认账户类型、模拟盘标记和 API Key 环境一致。",
         ],
+        "unsupported_private_path": [
+            "当前只读实盘验证只允许账户配置、余额、持仓和订单查询 GET 请求。",
+            "真实下单、撤单或转账路径必须继续保持本地锁定。",
+        ],
     }
     return actions.get(category, actions["okx_rejected"])
 
@@ -3846,6 +6580,8 @@ def okx_diagnostic_actions(category: str) -> list[str]:
 def okx_error_category(result: dict[str, Any]) -> str:
     if result.get("ok"):
         return "readonly_ok"
+    if result.get("category"):
+        return str(result.get("category"))
     if not result.get("configured"):
         return "missing_credentials"
     error = str(result.get("error") or "")
@@ -3877,6 +6613,81 @@ def okx_diagnostic_step(name: str, result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def okx_diagnostics_history_entry(result: dict[str, Any]) -> dict[str, Any]:
+    connector_health = result.get("connector_health") if isinstance(result.get("connector_health"), dict) else {}
+    connector = connector_health.get("connector") if isinstance(connector_health.get("connector"), dict) else {}
+    status = result.get("status") if isinstance(result.get("status"), dict) else {}
+    steps = result.get("steps") if isinstance(result.get("steps"), list) else []
+    return {
+        "time": result.get("updated_at") or now_iso(),
+        "ok": bool(result.get("ok")),
+        "readonly_ok": bool(result.get("readonly_ok")),
+        "category": result.get("category"),
+        "configured": bool(status.get("configured")),
+        "simulated": bool(status.get("simulated")),
+        "base_url": status.get("base_url") or OKX_API_BASE_URL,
+        "step_count": len(steps),
+        "steps": [
+            {
+                "name": step.get("name"),
+                "ok": bool(step.get("ok")),
+                "category": step.get("category"),
+                "code": step.get("code"),
+                "message": redact_sensitive_text(str(step.get("message") or "")) or "",
+            }
+            for step in steps
+            if isinstance(step, dict)
+        ],
+        "connector": {
+            "status": connector_health.get("status"),
+            "signature_ready": bool(connector_health.get("signature_ready") or connector.get("signature_ready")),
+            "dry_run_only": True,
+            "can_submit_live": False,
+            "next_action": connector_health.get("next_action"),
+        },
+        "account": {
+            "total_equity_usd": (result.get("account") or {}).get("total_equity_usd") if isinstance(result.get("account"), dict) else None,
+            "adjusted_equity_usd": (result.get("account") or {}).get("adjusted_equity_usd") if isinstance(result.get("account"), dict) else None,
+        },
+        "positions": {
+            "count": (result.get("positions") or {}).get("count") if isinstance(result.get("positions"), dict) else None,
+            "raw_count": (result.get("positions") or {}).get("raw_count") if isinstance(result.get("positions"), dict) else None,
+        },
+        "actions": [redact_sensitive_text(str(item)) or "" for item in (result.get("actions") or [])[:3]],
+    }
+
+
+def append_okx_diagnostics_history(result: dict[str, Any]) -> dict[str, Any]:
+    entry = okx_diagnostics_history_entry(result)
+    CACHE_DIR.mkdir(exist_ok=True)
+    with OKX_DIAGNOSTICS_LOCK:
+        with OKX_DIAGNOSTICS_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return entry
+
+
+def read_okx_diagnostics_history(limit: int = 50) -> dict[str, Any]:
+    if not OKX_DIAGNOSTICS_FILE.exists():
+        return {"path": str(OKX_DIAGNOSTICS_FILE), "rows": [], "count": 0}
+    rows = []
+    with OKX_DIAGNOSTICS_LOCK:
+        lines = OKX_DIAGNOSTICS_FILE.read_text(encoding="utf-8").splitlines()[-max(1, min(limit, 500)) :]
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    rows = list(reversed(rows))
+    return {"path": str(OKX_DIAGNOSTICS_FILE), "rows": rows, "count": len(rows), "latest": rows[0] if rows else None}
+
+
+def okx_diagnostics_finalize(result: dict[str, Any]) -> dict[str, Any]:
+    append_okx_diagnostics_history(result)
+    return {**result, "history": read_okx_diagnostics_history(8)}
+
+
 def okx_diagnostics() -> dict[str, Any]:
     status = okx_credentials_status()
     credentials_step = {
@@ -3889,63 +6700,93 @@ def okx_diagnostics() -> dict[str, Any]:
     }
     if not status.get("configured"):
         category = "missing_credentials"
-        return {
+        health = okx_private_connector_health({"readonly_ok": False, "category": category, "steps": [credentials_step]})
+        return okx_diagnostics_finalize({
             "ok": False,
             "readonly_ok": False,
             "category": category,
             "status": status,
             "local_utc": okx_timestamp(),
             "steps": [credentials_step],
+            "connector_health": health,
             "actions": okx_diagnostic_actions(category),
             "updated_at": now_iso(),
-        }
+        })
 
     steps = [credentials_step]
     account_config = okx_get("/api/v5/account/config")
     steps.append(okx_diagnostic_step("account_config", account_config))
     if not account_config.get("ok"):
         category = okx_error_category(account_config)
-        return {
+        health = okx_private_connector_health({"readonly_ok": False, "category": category, "steps": steps})
+        return okx_diagnostics_finalize({
             "ok": False,
             "readonly_ok": False,
             "category": category,
             "status": status,
             "local_utc": okx_timestamp(),
             "steps": steps,
+            "connector_health": health,
             "actions": okx_diagnostic_actions(category),
             "updated_at": now_iso(),
-        }
+        })
 
     balance = okx_account_readonly()
     steps.append(okx_diagnostic_step("account_balance", balance))
     if not balance.get("ok"):
         category = okx_error_category(balance)
-        return {
+        health = okx_private_connector_health({"readonly_ok": False, "category": category, "steps": steps})
+        return okx_diagnostics_finalize({
             "ok": False,
             "readonly_ok": False,
             "category": category,
             "status": status,
             "local_utc": okx_timestamp(),
             "steps": steps,
+            "connector_health": health,
             "actions": okx_diagnostic_actions(category),
             "updated_at": now_iso(),
-        }
+        })
+
+    positions = okx_positions_readonly({"instType": "SWAP"})
+    steps.append(okx_diagnostic_step("account_positions", positions))
+    if not positions.get("ok"):
+        category = okx_error_category(positions)
+        health = okx_private_connector_health({"readonly_ok": False, "category": category, "steps": steps})
+        return okx_diagnostics_finalize({
+            "ok": False,
+            "readonly_ok": False,
+            "category": category,
+            "status": status,
+            "local_utc": okx_timestamp(),
+            "steps": steps,
+            "connector_health": health,
+            "actions": okx_diagnostic_actions(category),
+            "updated_at": now_iso(),
+        })
 
     category = "readonly_ok"
-    return {
+    health = okx_private_connector_health({"readonly_ok": True, "category": category, "steps": steps})
+    return okx_diagnostics_finalize({
         "ok": True,
         "readonly_ok": True,
         "category": category,
         "status": status,
         "local_utc": okx_timestamp(),
         "steps": steps,
+        "connector_health": health,
         "actions": okx_diagnostic_actions(category),
         "account": {
             "total_equity_usd": balance.get("total_equity_usd"),
             "adjusted_equity_usd": balance.get("adjusted_equity_usd"),
         },
+        "positions": {
+            "count": positions.get("count"),
+            "raw_count": positions.get("raw_count"),
+        },
+        "order_query_request_preview": health.get("order_query_request_preview"),
         "updated_at": now_iso(),
-    }
+    })
 
 
 def okx_account_equity_or_none() -> float | None:
@@ -3972,6 +6813,16 @@ def execution_environment_status() -> dict[str, Any]:
         "okx_account": account,
         "okx_positions": positions,
         "readonly_ready": bool(account.get("ok")),
+        "connector_health": okx_private_connector_health(
+            {
+                "readonly_ok": bool(account.get("ok") and positions.get("ok")),
+                "category": "readonly_ok" if account.get("ok") and positions.get("ok") else okx_error_category(account if not account.get("ok") else positions),
+                "steps": [
+                    okx_diagnostic_step("account_balance", account),
+                    okx_diagnostic_step("account_positions", positions),
+                ],
+            }
+        ),
         "position_count": int(positions.get("count") or 0) if positions.get("ok") else 0,
         "equity_source": "okx_readonly" if account.get("ok") else "paper",
         "updated_at": now_iso(),
@@ -3986,7 +6837,13 @@ def submit_live_order_locked(params: dict[str, Any]) -> dict[str, Any]:
     instrument_rules = okx_instrument_rules(inst_id)
     exchange_validation = okx_order_validation(intent, instrument_rules)
     okx_order = okx_order_payload_preview(intent, exchange_validation, params, intent_fingerprint)
-    duplicate_intent = bool(intent_fingerprint and intent_fingerprint in execution_order_fingerprints())
+    canary_order = canary_order_preview(intent, instrument_rules, params, intent_fingerprint)
+    use_canary = bool(params.get("use_canary"))
+    submit_intent = canary_order.get("intent") if use_canary and canary_order.get("ok") else intent
+    submit_validation = canary_order.get("validation") if use_canary and canary_order.get("ok") else exchange_validation
+    submit_okx_order = canary_order.get("okx_order") if use_canary and canary_order.get("ok") else okx_order
+    submit_fingerprint = f"{intent_fingerprint}c" if use_canary and intent_fingerprint else intent_fingerprint
+    duplicate_intent = bool(submit_fingerprint and submit_fingerprint in execution_order_fingerprints())
     supplied_data_quality = params.get("data_quality") if isinstance(params.get("data_quality"), dict) else None
     okx_account = okx_account_readonly()
     okx_positions = okx_positions_readonly({"instType": "SWAP"}) if okx_account.get("configured") else {
@@ -3996,19 +6853,25 @@ def submit_live_order_locked(params: dict[str, Any]) -> dict[str, Any]:
         "count": 0,
         "error": okx_account.get("error"),
     }
+    gate_guard = {
+        **supplied_guard,
+        "allow_dry_run": True,
+        "decision": "Canary dry-run" if use_canary and canary_order.get("ok") else supplied_guard.get("decision"),
+    } if use_canary and canary_order.get("ok") else supplied_guard
     final_gate = final_submission_gate(
-        intent,
-        supplied_guard,
+        submit_intent,
+        gate_guard,
         okx_account,
         okx_positions,
-        {"instrument": instrument_rules, "validation": exchange_validation},
-        okx_order,
+        {"instrument": instrument_rules, "validation": submit_validation},
+        submit_okx_order,
         params,
         duplicate_intent=duplicate_intent,
         data_quality=supplied_data_quality,
     )
     confirmation = str(params.get("confirmation") or "")
     config = execution_config()
+    connector_status = config.get("connector_status") or okx_connector_status()
     checks = [
         {
             "name": "实盘总开关",
@@ -4048,21 +6911,21 @@ def submit_live_order_locked(params: dict[str, Any]) -> dict[str, Any]:
         },
         {
             "name": "OKX payload预览",
-            "passed": bool(okx_order.get("ok")),
-            "value": okx_order.get("status"),
+            "passed": bool(submit_okx_order.get("ok")),
+            "value": submit_okx_order.get("status"),
             "threshold": "ready",
-            "action": okx_order.get("message") or "先生成可审计的 OKX 下单 payload。",
+            "action": submit_okx_order.get("message") or "先生成可审计的 OKX 下单 payload。",
             "severity": "fail",
-            "status": "pass" if okx_order.get("ok") else "fail",
+            "status": "pass" if submit_okx_order.get("ok") else "fail",
         },
         {
-            "name": "连接器实现",
-            "passed": False,
-            "value": "未实现",
-            "threshold": "OKX live connector",
-            "action": "需要单独实现 OKX 下单适配器后才可真实提交。",
+            "name": "真实下单适配器",
+            "passed": bool(connector_status.get("can_submit_live")),
+            "value": "enabled" if connector_status.get("can_submit_live") else "dry_run_only",
+            "threshold": "LIVE_TRADING_ENABLED=true + OKX_LIVE_ORDER_ENABLED=true",
+            "action": connector_status.get("blocked_reason") or "打开真实下单适配器后才会提交。",
             "severity": "live_lock",
-            "status": "live_lock",
+            "status": "pass" if connector_status.get("can_submit_live") else "live_lock",
         },
     ]
     if duplicate_intent:
@@ -4070,14 +6933,14 @@ def submit_live_order_locked(params: dict[str, Any]) -> dict[str, Any]:
             {
                 "name": "幂等检查",
                 "passed": False,
-                "value": intent_fingerprint,
+                "value": submit_fingerprint,
                 "threshold": "未见重复",
                 "action": "同一订单意图已记录，拒绝重复提交。",
                 "severity": "fail",
                 "status": "fail",
             }
         )
-    if supplied_guard and not supplied_guard.get("allow_live"):
+    if supplied_guard and not supplied_guard.get("allow_live") and not (use_canary and canary_order.get("ok")):
         checks.append(
             {
                 "name": "预演保护",
@@ -4089,59 +6952,101 @@ def submit_live_order_locked(params: dict[str, Any]) -> dict[str, Any]:
                 "status": "fail",
             }
         )
+    if use_canary:
+        checks.append(
+            {
+                "name": "Canary payload",
+                "passed": bool(canary_order.get("ok")),
+                "value": canary_order.get("status"),
+                "threshold": "canary ready",
+                "action": canary_order.get("message") or "先生成 canary 小额 payload。",
+                "severity": "fail",
+                "status": "pass" if canary_order.get("ok") else "fail",
+            }
+        )
     blocked = [row for row in checks if not row["passed"]]
+    connector_attempt = okx_live_order_adapter_preview(submit_okx_order, final_gate, confirmation)
+    submitted = bool(connector_attempt.get("submitted"))
+    submit_mode = "canary" if use_canary else "standard"
+    shadow_order = None if submitted else okx_shadow_order_evidence(
+        submit_okx_order,
+        final_gate,
+        canary_order=canary_order,
+        connector_attempt=connector_attempt,
+        submit_mode=submit_mode,
+        source="live_submit_rejected",
+    )
     result = {
-        "ok": False,
-        "submitted": False,
-        "decision": "真实提交已锁定",
+        "ok": submitted,
+        "submitted": submitted,
+        "decision": "真实提交已发送" if submitted else "真实提交已锁定",
+        "submit_mode": submit_mode,
         "config": config,
-        "order_intent": intent,
-        "exchange_rules": {"instrument": instrument_rules, "validation": exchange_validation},
-        "okx_order": okx_order,
+        "connector_attempt": connector_attempt,
+        "order_intent": submit_intent,
+        "original_order_intent": intent,
+        "exchange_rules": {"instrument": instrument_rules, "validation": submit_validation},
+        "okx_order": submit_okx_order,
+        "standard_order": okx_order,
+        "canary_order": canary_order,
         "final_gate": final_gate,
         "data_quality": supplied_data_quality,
-        "intent_fingerprint": intent_fingerprint,
+        "shadow_order": shadow_order,
+        "intent_fingerprint": submit_fingerprint,
         "duplicate_intent": duplicate_intent,
         "checks": checks,
-        "blocked_reasons": [row["action"] for row in blocked],
+        "blocked_reasons": ([] if submitted else [row["action"] for row in blocked] + connector_attempt.get("blocked_reasons", [])),
     }
     append_execution_order(
         {
-            "event": "live_submit_rejected",
-            "status": "rejected",
-            "intent_fingerprint": intent_fingerprint,
+            "event": "live_submitted" if submitted else "live_submit_rejected",
+            "status": "submitted" if submitted else "rejected",
+            "intent_fingerprint": submit_fingerprint,
             "duplicate_intent": duplicate_intent,
-            "inst_id": intent.get("inst_id") if intent else params.get("instId") or params.get("inst_id"),
-            "bar": intent.get("bar") if intent else params.get("bar"),
-            "side": intent.get("side") if intent else None,
-            "notional": intent.get("notional") if intent else None,
-            "order_intent": intent,
-            "exchange_validation": exchange_validation,
-            "okx_order": okx_order,
+            "submit_mode": submit_mode,
+            "inst_id": submit_intent.get("inst_id") if submit_intent else params.get("instId") or params.get("inst_id"),
+            "bar": submit_intent.get("bar") if submit_intent else params.get("bar"),
+            "side": submit_intent.get("side") if submit_intent else None,
+            "notional": submit_intent.get("notional") if submit_intent else None,
+            "order_intent": submit_intent,
+            "original_order_intent": intent,
+            "exchange_validation": submit_validation,
+            "okx_order": submit_okx_order,
+            "canary_order": canary_order,
+            "connector_attempt": connector_attempt,
+            "shadow_order": shadow_order,
+            "okx_response": connector_attempt.get("okx_response"),
+            "exchange_order_id": connector_attempt.get("exchange_order_id"),
             "final_gate": final_gate,
             "data_quality": supplied_data_quality,
             "guard_decision": supplied_guard.get("decision"),
-            "allow_live": False,
+            "allow_live": bool(submitted),
             "allow_dry_run": supplied_guard.get("allow_dry_run"),
             "rejection_reasons": result["blocked_reasons"],
         }
     )
     append_paper_audit(
         {
-            "action": "live_submit_rejected",
-            "inst_id": intent.get("inst_id") if intent else params.get("instId") or params.get("inst_id"),
-            "bar": intent.get("bar") if intent else params.get("bar"),
+            "action": "live_submitted" if submitted else "live_submit_rejected",
+            "inst_id": submit_intent.get("inst_id") if submit_intent else params.get("instId") or params.get("inst_id"),
+            "bar": submit_intent.get("bar") if submit_intent else params.get("bar"),
             "strategy_mode": params.get("strategy_mode"),
             "params": audit_params(params),
-            "order_intent": intent,
-            "exchange_rules": {"instrument": instrument_rules, "validation": exchange_validation},
-            "okx_order": okx_order,
-            "intent_fingerprint": intent_fingerprint,
+            "submit_mode": submit_mode,
+            "order_intent": submit_intent,
+            "original_order_intent": intent,
+            "exchange_rules": {"instrument": instrument_rules, "validation": submit_validation},
+            "okx_order": submit_okx_order,
+            "canary_order": canary_order,
+            "connector_attempt": connector_attempt,
+            "shadow_order": shadow_order,
+            "intent_fingerprint": submit_fingerprint,
             "execution_guard": supplied_guard,
+            "gate_guard": gate_guard,
             "final_gate": final_gate,
             "data_quality": supplied_data_quality,
             "live_submit": result,
-            "actions": [{"type": "live_submit_rejected", "decision": result["decision"]}],
+            "actions": [{"type": "live_submitted" if submitted else "live_submit_rejected", "decision": result["decision"]}],
         }
     )
     return result
@@ -4499,9 +7404,23 @@ def validate_time_slices(params: dict[str, Any]) -> dict[str, Any]:
 def cache_status() -> dict[str, Any]:
     status = MARKET_DATA.status()
     rows = [annotate_cache_refresh_priority(row) for row in status.get("rows", [])]
+    stale_rows = [row for row in rows if row.get("is_stale")]
+    recommended_rows = [row for row in rows if row.get("recommended_refresh")]
+    high_cost_rows = [
+        row
+        for row in stale_rows
+        if row.get("high_refresh_cost") and not row.get("covered_by_fresh_cache")
+    ]
     return {
         **status,
         "rows": rows,
+        "summary": {
+            "rows": len(rows),
+            "stale": len(stale_rows),
+            "recommended": len(recommended_rows),
+            "high_cost_stale": len(high_cost_rows),
+            "max_auto_refresh_estimated_requests": MAX_AUTO_REFRESH_ESTIMATED_REQUESTS,
+        },
         "portfolio_result_cache": PORTFOLIO_RESULT_CACHE.status(),
     }
 
@@ -4567,6 +7486,50 @@ def task_system_status() -> dict[str, Any]:
         }
 
 
+def execution_lifecycle_system_status(limit: int = 100) -> dict[str, Any]:
+    rows = read_execution_orders(limit).get("rows", [])
+    latest_by_order: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        lifecycle = row.get("lifecycle") or {}
+        key = (
+            row.get("intent_fingerprint")
+            or lifecycle.get("exchange_order_id")
+            or lifecycle.get("client_order_id")
+            or f"{row.get('event')}-{row.get('time')}"
+        )
+        if key and key not in latest_by_order:
+            latest_by_order[str(key)] = row
+    current_rows = list(latest_by_order.values())
+    phases: dict[str, int] = {}
+    for row in current_rows:
+        phase = str((row.get("lifecycle") or {}).get("phase") or "unknown")
+        phases[phase] = phases.get(phase, 0) + 1
+    blocked = [row for row in current_rows if (row.get("lifecycle") or {}).get("phase") in {"ack_timeout", "cancel_due"}]
+    tracking = [row for row in current_rows if (row.get("lifecycle") or {}).get("phase") in {"pending_ack", "open"}]
+    latest = current_rows[0] if current_rows else None
+    return {
+        "total": len(rows),
+        "current_orders": len(current_rows),
+        "phases": phases,
+        "blocked_count": len(blocked),
+        "tracking_count": len(tracking),
+        "latest_phase": (latest.get("lifecycle") or {}).get("phase") if latest else None,
+        "latest_label": (latest.get("lifecycle") or {}).get("label") if latest else None,
+        "latest_action": (latest.get("lifecycle") or {}).get("next_action") if latest else None,
+        "blocked": [
+            {
+                "time": row.get("time"),
+                "event": row.get("event"),
+                "status": row.get("status"),
+                "intent_fingerprint": row.get("intent_fingerprint"),
+                "inst_id": row.get("inst_id"),
+                "lifecycle": row.get("lifecycle"),
+            }
+            for row in blocked[:5]
+        ],
+    }
+
+
 def system_recommendations(
     *,
     stale_count: int,
@@ -4574,8 +7537,11 @@ def system_recommendations(
     files: dict[str, dict[str, Any]],
     tasks: dict[str, Any],
     okx_status: dict[str, Any],
+    connector_health: dict[str, Any] | None = None,
+    execution: dict[str, Any],
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    connector_health = connector_health or {}
     if recommended_count > 0:
         rows.append(
             {
@@ -4611,6 +7577,17 @@ def system_recommendations(
                 "target_view": "实盘",
             }
         )
+    elif not connector_health.get("signature_ready"):
+        rows.append(
+            {
+                "priority": "medium",
+                "area": "实盘",
+                "title": "复核 OKX 签名预览",
+                "detail": "OKX 密钥存在，但私有接口签名预览未就绪。",
+                "action": connector_health.get("next_action") or "进入实盘页运行 OKX 诊断。",
+                "target_view": "实盘",
+            }
+        )
     if not files.get("paper_state", {}).get("exists"):
         rows.append(
             {
@@ -4630,6 +7607,28 @@ def system_recommendations(
                 "title": "生成执行账本",
                 "detail": "执行账本文件缺失，无法追踪 dry-run 和重复订单意图。",
                 "action": "运行一次执行预演以初始化账本。",
+                "target_view": "实盘",
+            }
+        )
+    elif int(execution.get("blocked_count") or 0) > 0:
+        rows.append(
+            {
+                "priority": "high",
+                "area": "执行",
+                "title": "处理执行生命周期阻断",
+                "detail": f"{execution.get('blocked_count')} 条订单生命周期记录存在回执超时或待撤单。",
+                "action": execution.get("latest_action") or "进入实盘页查看执行账本并处理撤单保护。",
+                "target_view": "实盘",
+            }
+        )
+    elif int(execution.get("tracking_count") or 0) > 0:
+        rows.append(
+            {
+                "priority": "info",
+                "area": "执行",
+                "title": "跟踪执行生命周期",
+                "detail": f"{execution.get('tracking_count')} 条订单记录仍在等待回执、成交或撤单条件。",
+                "action": "进入实盘页刷新执行账本，确认是否到达超时阈值。",
                 "target_view": "实盘",
             }
         )
@@ -4658,11 +7657,87 @@ def system_recommendations(
     return rows
 
 
+def latest_recent_backtest_evidence_status() -> dict[str, Any]:
+    if not LAUNCHD_EVIDENCE_DIR.exists():
+        return {
+            "ok": False,
+            "status": "missing",
+            "detail": "recent-backtest evidence directory is missing",
+            "path": str(LAUNCHD_EVIDENCE_DIR),
+            "fresh_seconds": RECENT_BACKTEST_EVIDENCE_FRESH_SECONDS,
+        }
+    paths = sorted(LAUNCHD_EVIDENCE_DIR.glob("recent-backtest-*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+    if not paths:
+        return {
+            "ok": False,
+            "status": "missing",
+            "detail": "no recent-backtest evidence found",
+            "path": str(LAUNCHD_EVIDENCE_DIR),
+            "fresh_seconds": RECENT_BACKTEST_EVIDENCE_FRESH_SECONDS,
+        }
+    path = paths[0]
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            "ok": False,
+            "status": "invalid",
+            "detail": f"failed to read {path.name}: {exc}",
+            "path": str(path),
+            "fresh_seconds": RECENT_BACKTEST_EVIDENCE_FRESH_SECONDS,
+        }
+    portfolio = payload.get("portfolio") if isinstance(payload.get("portfolio"), dict) else {}
+    portfolio_result = portfolio.get("result") if isinstance(portfolio.get("result"), dict) else {}
+    summary = portfolio_result.get("summary") if isinstance(portfolio_result.get("summary"), dict) else {}
+    health = portfolio_result.get("health") if isinstance(portfolio_result.get("health"), dict) else {}
+    slices = payload.get("slices") if isinstance(payload.get("slices"), dict) else {}
+    slices_result = slices.get("result") if isinstance(slices.get("result"), dict) else {}
+    aggregate = slices_result.get("aggregate") if isinstance(slices_result.get("aggregate"), dict) else {}
+    runtime = payload.get("runtime") if isinstance(payload.get("runtime"), dict) else {}
+    age_seconds = iso_age_seconds(str(payload.get("generated_at") or "")) if payload.get("generated_at") else None
+    if age_seconds is None:
+        age_seconds = max(0, time.time() - path.stat().st_mtime)
+    fresh = age_seconds <= RECENT_BACKTEST_EVIDENCE_FRESH_SECONDS
+    locks_ok = bool(runtime.get("live_submit_locked") and runtime.get("live_env_locked"))
+    payload_ok = bool(payload.get("ok") and portfolio.get("ok") and slices.get("ok") and locks_ok)
+    ok = bool(payload_ok and fresh)
+    return {
+        "ok": ok,
+        "status": "ok" if ok else "stale" if payload_ok and not fresh else "warning",
+        "detail": (
+            f"return={summary.get('return_pct', '-')} · "
+            f"health={health.get('grade') or '-'} {health.get('score') if health.get('score') is not None else '-'} · "
+            f"slices={aggregate.get('cases') if aggregate.get('cases') is not None else '-'} · "
+            f"locks={locks_ok}"
+        ),
+        "path": str(path),
+        "generated_at": payload.get("generated_at"),
+        "age_seconds": age_seconds,
+        "fresh_seconds": RECENT_BACKTEST_EVIDENCE_FRESH_SECONDS,
+        "payload_ok": payload_ok,
+        "fresh": fresh,
+        "locks_ok": locks_ok,
+        "return_pct": summary.get("return_pct"),
+        "final_equity": summary.get("final_equity"),
+        "max_drawdown": summary.get("max_drawdown"),
+        "trades": summary.get("trades"),
+        "health_grade": health.get("grade"),
+        "health_score": health.get("score"),
+        "slice_cases": aggregate.get("cases"),
+        "slice_positive_cases": aggregate.get("positive_cases"),
+    }
+
+
 def system_status() -> dict[str, Any]:
     cache = cache_status()
     rows = cache.get("rows", [])
     stale_rows = [row for row in rows if row.get("is_stale")]
     recommended_rows = [row for row in rows if row.get("recommended_refresh")]
+    high_cost_rows = [
+        row
+        for row in stale_rows
+        if row.get("high_refresh_cost") and not row.get("covered_by_fresh_cache")
+    ]
     okx_status = okx_credentials_status()
     files = {
         "task_history": path_status(TASK_HISTORY_FILE),
@@ -4670,9 +7745,14 @@ def system_status() -> dict[str, Any]:
         "paper_events": path_status(PAPER_EVENT_FILE),
         "paper_audit": path_status(PAPER_AUDIT_FILE),
         "execution_orders": path_status(EXECUTION_ORDER_FILE),
+        "automation_state": path_status(AUTOMATION_STATE_FILE),
         "signal_log": path_status(SIGNAL_LOG_FILE),
     }
     tasks = task_system_status()
+    execution = execution_lifecycle_system_status()
+    connector_health = okx_private_connector_health()
+    automation = automation_status()
+    recent_backtest = latest_recent_backtest_evidence_status()
     return {
         "ok": True,
         "server": {
@@ -4685,18 +7765,24 @@ def system_status() -> dict[str, Any]:
             "okx_configured": bool(okx_status.get("configured")),
             "okx_simulated": bool(okx_status.get("simulated")),
             "okx_base_url": OKX_API_BASE_URL,
+            "connector_health": connector_health,
         },
         "cache": {
             **cache_directory_status(),
             "market_rows": len(rows),
             "stale_rows": len(stale_rows),
             "recommended_rows": len(recommended_rows),
+            "high_cost_stale_rows": len(high_cost_rows),
+            "max_auto_refresh_estimated_requests": MAX_AUTO_REFRESH_ESTIMATED_REQUESTS,
             "portfolio_result_cache": cache.get("portfolio_result_cache"),
         },
         "tasks": {
             **tasks,
             "history_file": files["task_history"],
         },
+        "recent_backtest": recent_backtest,
+        "execution": execution,
+        "automation": automation,
         "files": files,
         "recommendations": system_recommendations(
             stale_count=len(stale_rows),
@@ -4704,6 +7790,8 @@ def system_status() -> dict[str, Any]:
             files=files,
             tasks=tasks,
             okx_status=okx_status,
+            connector_health=connector_health,
+            execution=execution,
         ),
     }
 
@@ -4788,6 +7876,7 @@ def annotate_cache_refresh_priority(row: dict[str, Any]) -> dict[str, Any]:
     age_seconds = float(row.get("latest_closed_age_seconds") or 0.0)
     stale_after_seconds = float(row.get("stale_after_seconds") or 0.0)
     estimated_requests = 1 if count <= 300 else 1 + max(0, math.ceil((count - 300) / 100))
+    high_refresh_cost = estimated_requests > MAX_AUTO_REFRESH_ESTIMATED_REQUESTS
     symbols = {"BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"}
     reasons: list[str] = []
     priority = 0
@@ -4802,6 +7891,8 @@ def annotate_cache_refresh_priority(row: dict[str, Any]) -> dict[str, Any]:
             "refresh_priority": priority,
             "refresh_reasons": reasons[:4],
             "recommended_refresh": False,
+            "high_refresh_cost": high_refresh_cost,
+            "max_auto_refresh_estimated_requests": MAX_AUTO_REFRESH_ESTIMATED_REQUESTS,
             "refresh_estimated_requests": estimated_requests,
             "refresh_cost_label": "覆盖复用",
             "stale_after_minutes": round(stale_after_seconds / 60, 1) if stale_after_seconds else None,
@@ -4822,6 +7913,9 @@ def annotate_cache_refresh_priority(row: dict[str, Any]) -> dict[str, Any]:
     elif count >= 5000:
         priority -= 8
         reasons.append("历史窗口较大")
+    if high_refresh_cost:
+        priority -= 18
+        reasons.append("自动刷新成本高")
     if age_seconds >= 7 * 24 * 3600:
         priority += 10
         reasons.append("超过7天")
@@ -4834,7 +7928,9 @@ def annotate_cache_refresh_priority(row: dict[str, Any]) -> dict[str, Any]:
         **row,
         "refresh_priority": max(0, priority),
         "refresh_reasons": reasons[:4],
-        "recommended_refresh": is_stale and priority >= 60,
+        "recommended_refresh": is_stale and priority >= 60 and not high_refresh_cost,
+        "high_refresh_cost": high_refresh_cost,
+        "max_auto_refresh_estimated_requests": MAX_AUTO_REFRESH_ESTIMATED_REQUESTS,
         "refresh_estimated_requests": estimated_requests,
         "refresh_cost_label": f"约 {estimated_requests} 次请求",
         "stale_after_minutes": round(stale_after_seconds / 60, 1) if stale_after_seconds else None,
@@ -4919,6 +8015,27 @@ def refresh_candle_cache_row(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def refresh_candle_cache(params: dict[str, Any]) -> dict[str, Any]:
+    if not DATA_REFRESH_RUN_LOCK.acquire(blocking=False):
+        progress = data_refresh_progress()
+        return {
+            "batch_id": progress.get("batch_id"),
+            "mode": str(params.get("mode") or "manual"),
+            "ok": 0,
+            "failed": 0,
+            "results": [],
+            "skipped_due_to_active_refresh": True,
+            "active_refresh": progress,
+            "progress": progress,
+            "cache": cache_status(),
+        }
+    try:
+        return _refresh_candle_cache_locked(params)
+    finally:
+        set_data_refresh_progress(active=False, current=None)
+        DATA_REFRESH_RUN_LOCK.release()
+
+
+def _refresh_candle_cache_locked(params: dict[str, Any]) -> dict[str, Any]:
     rows = params.get("rows")
     if rows is None:
         rows = [params]
@@ -4995,16 +8112,24 @@ def refresh_candle_cache(params: dict[str, Any]) -> dict[str, Any]:
 def refresh_stale_candle_cache(params: dict[str, Any]) -> dict[str, Any]:
     max_items = max(1, min(int(params.get("max_items", 4)), 12))
     recommended_only = bool(params.get("recommended_only", False))
+    include_high_cost = bool(params.get("include_high_cost", False))
     status = cache_status()
     stale_rows = [row for row in status.get("rows", []) if row.get("is_stale")]
     skipped_covered_rows = [row for row in stale_rows if row.get("covered_by_fresh_cache")]
     stale_rows = [row for row in stale_rows if not row.get("covered_by_fresh_cache")]
+    skipped_high_cost_rows: list[dict[str, Any]] = []
+    if not include_high_cost:
+        skipped_high_cost_rows = [row for row in stale_rows if row.get("high_refresh_cost")]
+        stale_rows = [row for row in stale_rows if not row.get("high_refresh_cost")]
     if recommended_only:
         stale_rows = [row for row in stale_rows if row.get("recommended_refresh")]
     stale_rows.sort(key=lambda row: (-int(row.get("refresh_priority") or 0), int(row.get("count") or row.get("candles") or 0)))
     result = refresh_candle_cache({"rows": stale_rows, "max_items": max_items, "mode": "recommended" if recommended_only else "stale", "task_id": params.get("task_id")})
     result["skipped_covered"] = len(skipped_covered_rows)
     result["skipped_covered_rows"] = skipped_covered_rows[:12]
+    result["skipped_high_cost"] = len(skipped_high_cost_rows)
+    result["skipped_high_cost_rows"] = skipped_high_cost_rows[:12]
+    result["include_high_cost"] = include_high_cost
     return result
 
 
@@ -5369,6 +8494,239 @@ def read_paper_audit(limit: int = 100) -> dict[str, Any]:
     return {"path": str(PAPER_AUDIT_FILE), "rows": list(reversed(rows))}
 
 
+def paper_equity_slot(value: Any | None = None) -> str:
+    parsed = parse_iso_timestamp(value) if value else None
+    parsed = parsed or datetime.now(timezone.utc)
+    interval = max(60, int(ACCOUNT_EQUITY_INTERVAL_SECONDS or 900))
+    slot_ts = int(parsed.timestamp()) // interval * interval
+    return datetime.fromtimestamp(slot_ts, tz=timezone.utc).isoformat()
+
+
+def latest_jsonl_row(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            return row
+    return None
+
+
+def paper_equity_entry(state: PaperState, *, source: str = "paper_loop", timestamp: str | None = None) -> dict[str, Any]:
+    recorded_at = timestamp or datetime.now(timezone.utc).isoformat()
+    return {
+        "time": recorded_at,
+        "slot": paper_equity_slot(recorded_at),
+        "source": source,
+        "anchor_date": ACCOUNT_EQUITY_ANCHOR_DATE,
+        "interval_seconds": ACCOUNT_EQUITY_INTERVAL_SECONDS,
+        "running": bool(state.running),
+        "inst_id": state.inst_id,
+        "bar": state.bar,
+        "strategy_mode": state.strategy_mode,
+        "equity": audit_number(state.equity, 8),
+        "peak_equity": audit_number(state.peak_equity, 8),
+        "day_start_equity": audit_number(state.day_start_equity, 8),
+        "day_key": state.day_key,
+        "day_trades": state.day_trades,
+        "consecutive_losses": state.consecutive_losses,
+        "position_open": bool(state.position),
+        "position": state.position,
+        "paper_updated_at": state.updated_at,
+    }
+
+
+def should_write_paper_equity_snapshot(last: dict[str, Any] | None, entry: dict[str, Any], source: str) -> bool:
+    if not last:
+        return True
+    if source in {"start", "stop"}:
+        return True
+    if last.get("slot") != entry.get("slot"):
+        return True
+    try:
+        equity_changed = abs(float(last.get("equity") or 0) - float(entry.get("equity") or 0)) > 1e-9
+    except (TypeError, ValueError):
+        equity_changed = last.get("equity") != entry.get("equity")
+    return bool(
+        equity_changed
+        or bool(last.get("running")) != bool(entry.get("running"))
+        or bool(last.get("position_open")) != bool(entry.get("position_open"))
+        or last.get("day_trades") != entry.get("day_trades")
+    )
+
+
+def record_paper_equity_snapshot(state: PaperState, *, source: str = "paper_loop", timestamp: str | None = None) -> dict[str, Any]:
+    entry = paper_equity_entry(state, source=source, timestamp=timestamp)
+    with PAPER_EQUITY_LOCK:
+        last = latest_jsonl_row(PAPER_EQUITY_FILE)
+        if not should_write_paper_equity_snapshot(last, entry, source):
+            return {"ok": True, "written": False, "path": str(PAPER_EQUITY_FILE), "entry": last}
+        with PAPER_EQUITY_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return {"ok": True, "written": True, "path": str(PAPER_EQUITY_FILE), "entry": entry}
+
+
+def read_equity_history_file(path: Path, lock: threading.Lock, *, limit: int = 1000, start: str | None = None) -> dict[str, Any]:
+    max_limit = max(1, min(int(limit or 1000), 20000))
+    start_dt = parse_iso_timestamp(start) if start else None
+    if not path.exists():
+        return {
+            "path": str(path),
+            "rows": [],
+            "count": 0,
+            "anchor_date": ACCOUNT_EQUITY_ANCHOR_DATE,
+            "interval_seconds": ACCOUNT_EQUITY_INTERVAL_SECONDS,
+        }
+    rows_by_slot: dict[str, dict[str, Any]] = {}
+    with lock:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        slot = row.get("slot") or paper_equity_slot(row.get("time"))
+        slot_dt = parse_iso_timestamp(slot)
+        if start_dt and slot_dt and slot_dt < start_dt:
+            continue
+        row["slot"] = slot
+        rows_by_slot[str(slot)] = row
+    rows = sorted(rows_by_slot.values(), key=lambda item: str(item.get("slot") or item.get("time") or ""))
+    if len(rows) > max_limit:
+        rows = rows[-max_limit:]
+    return {
+        "path": str(path),
+        "rows": rows,
+        "count": len(rows),
+        "latest": rows[-1] if rows else None,
+        "anchor_date": ACCOUNT_EQUITY_ANCHOR_DATE,
+        "interval_seconds": ACCOUNT_EQUITY_INTERVAL_SECONDS,
+    }
+
+
+def read_paper_equity_history_file(limit: int = 1000, start: str | None = None) -> dict[str, Any]:
+    return {
+        **read_equity_history_file(PAPER_EQUITY_FILE, PAPER_EQUITY_LOCK, limit=limit, start=start),
+        "source": "paper_loop",
+        "source_label": "模拟盘权益",
+        "readonly_ok": False,
+        "okx_configured": bool(okx_credentials_status().get("configured")),
+    }
+
+
+def okx_account_equity_entry(account: dict[str, Any], *, source: str = "okx_readonly", timestamp: str | None = None) -> dict[str, Any]:
+    recorded_at = timestamp or datetime.now(timezone.utc).isoformat()
+    details = account.get("details") if isinstance(account.get("details"), list) else []
+    return {
+        "time": recorded_at,
+        "slot": paper_equity_slot(recorded_at),
+        "source": source,
+        "anchor_date": ACCOUNT_EQUITY_ANCHOR_DATE,
+        "interval_seconds": ACCOUNT_EQUITY_INTERVAL_SECONDS,
+        "readonly_scope": account.get("readonly_scope") or "account_balance",
+        "equity": audit_number(account.get("total_equity_usd"), 8),
+        "total_equity_usd": audit_number(account.get("total_equity_usd"), 8),
+        "adjusted_equity_usd": audit_number(account.get("adjusted_equity_usd"), 8),
+        "isolated_equity_usd": audit_number(account.get("isolated_equity_usd"), 8),
+        "detail_count": len(details),
+        "currencies": [
+            {
+                "ccy": row.get("ccy"),
+                "equity": row.get("equity"),
+                "available_balance": row.get("available_balance"),
+                "u_pnl": row.get("u_pnl"),
+            }
+            for row in details[:8]
+            if isinstance(row, dict)
+        ],
+        "updated_at": account.get("updated_at") or recorded_at,
+    }
+
+
+def record_okx_account_equity_snapshot(*, source: str = "okx_readonly") -> dict[str, Any]:
+    now = datetime.now(timezone.utc).isoformat()
+    slot = paper_equity_slot(now)
+    status = okx_credentials_status()
+    if not status.get("configured"):
+        return {
+            "ok": False,
+            "configured": False,
+            "written": False,
+            "category": "missing_credentials",
+            "path": str(ACCOUNT_EQUITY_FILE),
+            "entry": None,
+        }
+    with ACCOUNT_EQUITY_LOCK:
+        last = latest_jsonl_row(ACCOUNT_EQUITY_FILE)
+        if last and last.get("slot") == slot:
+            return {
+                "ok": True,
+                "configured": True,
+                "written": False,
+                "cached": True,
+                "category": "cached_current_slot",
+                "path": str(ACCOUNT_EQUITY_FILE),
+                "entry": last,
+            }
+    account = okx_account_readonly()
+    if not account.get("ok"):
+        return {
+            "ok": False,
+            "configured": bool(account.get("configured")),
+            "written": False,
+            "category": okx_error_category(account),
+            "error": redact_sensitive_text(str(account.get("error") or "")) or "",
+            "path": str(ACCOUNT_EQUITY_FILE),
+            "entry": None,
+        }
+    entry = okx_account_equity_entry(account, source=source, timestamp=now)
+    with ACCOUNT_EQUITY_LOCK:
+        last = latest_jsonl_row(ACCOUNT_EQUITY_FILE)
+        if not should_write_paper_equity_snapshot(last, entry, source):
+            return {"ok": True, "configured": True, "written": False, "path": str(ACCOUNT_EQUITY_FILE), "entry": last}
+        with ACCOUNT_EQUITY_FILE.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    return {"ok": True, "configured": True, "written": True, "path": str(ACCOUNT_EQUITY_FILE), "entry": entry}
+
+
+def read_okx_account_equity_history(limit: int = 1000, start: str | None = None) -> dict[str, Any]:
+    return {
+        **read_equity_history_file(ACCOUNT_EQUITY_FILE, ACCOUNT_EQUITY_LOCK, limit=limit, start=start),
+        "source": "okx_readonly",
+        "source_label": "OKX只读账户权益",
+        "readonly_ok": True,
+        "okx_configured": True,
+    }
+
+
+def read_paper_equity_history(limit: int = 1000, start: str | None = None) -> dict[str, Any]:
+    okx_snapshot = record_okx_account_equity_snapshot()
+    if okx_snapshot.get("ok"):
+        history = read_okx_account_equity_history(limit, start)
+        return {
+            **history,
+            "current_snapshot": okx_snapshot,
+            "fallback_source": "paper_loop",
+        }
+    paper_history = read_paper_equity_history_file(limit, start)
+    return {
+        **paper_history,
+        "okx_snapshot": okx_snapshot,
+        "fallback_reason": okx_snapshot.get("category") or "okx_unavailable",
+    }
+
+
 def signature_diffs(recorded: dict[str, Any], replay: dict[str, Any]) -> list[dict[str, Any]]:
     diffs = []
     for key in sorted(set(recorded) | set(replay)):
@@ -5583,6 +8941,7 @@ def paper_loop() -> None:
                 continue
             inst_id = paper_state.inst_id
             bar = paper_state.bar
+            strategy_mode = paper_state.strategy_mode
             state_params = dict(paper_state.params)
             equity = paper_state.equity
             peak_equity = paper_state.peak_equity
@@ -5595,7 +8954,7 @@ def paper_loop() -> None:
             equity_before = equity
             position_before = dict(existing_position) if existing_position else None
             params = {
-                "strategy_mode": paper_state.strategy_mode,
+                "strategy_mode": strategy_mode,
                 "lookback": 12,
                 "atr_period": 14,
                 "adx_period": 14,
@@ -5682,6 +9041,18 @@ def paper_loop() -> None:
             signal = scan.get("signal")
             log_key = f"{inst_id}:{scan.get('context', {}).get('time')}"
             should_log = log_key != paper_state.last_signal_log_key
+            if should_log:
+                automation_consider_preflight(scan, {**params, "instId": inst_id, "bar": bar, "strategy_mode": strategy_mode})
+            automation_record_heartbeat(
+                {
+                    "running": True,
+                    "inst_id": inst_id,
+                    "bar": bar,
+                    "equity": equity,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+                scan,
+            )
             with paper_lock:
                 paper_state.equity = equity
                 paper_state.peak_equity = peak_equity
@@ -5795,6 +9166,7 @@ def paper_loop() -> None:
                             "scan_signature": paper_scan_signature(scan),
                         }
                     )
+                record_paper_equity_snapshot(paper_state, source="paper_loop", timestamp=paper_state.updated_at)
                 save_paper_state(paper_state)
         except Exception as exc:
             with paper_lock:
@@ -5878,6 +9250,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(read_paper_audit(limit))
             return
 
+        if parsed.path == "/api/paper/equity-history":
+            query = urllib.parse.parse_qs(parsed.query)
+            limit = int(query.get("limit", ["1000"])[0])
+            start = query.get("start", [None])[0]
+            self.send_json(read_paper_equity_history(limit, start))
+            return
+
         if parsed.path == "/api/paper/reconcile":
             query = urllib.parse.parse_qs(parsed.query)
             limit = int(query.get("limit", ["20"])[0])
@@ -5902,6 +9281,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(okx_diagnostics())
             return
 
+        if parsed.path == "/api/okx/diagnostics-history":
+            query = urllib.parse.parse_qs(parsed.query)
+            try:
+                limit = int(query.get("limit", ["50"])[0])
+            except ValueError:
+                limit = 50
+            self.send_json(read_okx_diagnostics_history(limit))
+            return
+
         if parsed.path == "/api/okx/instruments":
             query = urllib.parse.parse_qs(parsed.query)
             inst_id = query.get("instId", ["BTC-USDT-SWAP"])[0]
@@ -5915,8 +9303,76 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(okx_positions_readonly(params))
             return
 
+        if parsed.path == "/api/ai4trade/status":
+            query = urllib.parse.parse_qs(parsed.query)
+            params = {key: values[0] for key, values in query.items() if values}
+            self.send_json(ai4trade_status(params))
+            return
+
+        if parsed.path == "/api/ai4trade/history":
+            query = urllib.parse.parse_qs(parsed.query)
+            try:
+                limit = int(query.get("limit", ["50"])[0])
+            except ValueError:
+                limit = 50
+            self.send_json(read_ai4trade_history(limit))
+            return
+
         if parsed.path == "/api/execution/environment":
             self.send_json(execution_environment_status())
+            return
+
+        if parsed.path == "/api/automation/status":
+            self.send_json(automation_status())
+            return
+
+        if parsed.path == "/api/automation/task-board":
+            self.send_json(automation_task_board_status())
+            return
+
+        if parsed.path == "/api/automation/preflight-history":
+            query = urllib.parse.parse_qs(parsed.query)
+            try:
+                limit = int(query.get("limit", ["30"])[0])
+            except ValueError:
+                limit = 30
+            self.send_json(read_automation_preflight_history(limit))
+            return
+
+        if parsed.path == "/api/automation/heartbeat-history":
+            query = urllib.parse.parse_qs(parsed.query)
+            try:
+                limit = int(query.get("limit", ["60"])[0])
+            except ValueError:
+                limit = 60
+            self.send_json(read_automation_heartbeat_history(limit))
+            return
+
+        if parsed.path == "/api/automation/event-history":
+            query = urllib.parse.parse_qs(parsed.query)
+            try:
+                limit = int(query.get("limit", ["60"])[0])
+            except ValueError:
+                limit = 60
+            self.send_json(read_automation_event_history(limit))
+            return
+
+        if parsed.path == "/api/automation/readiness-snapshots":
+            query = urllib.parse.parse_qs(parsed.query)
+            try:
+                limit = int(query.get("limit", ["30"])[0])
+            except ValueError:
+                limit = 30
+            self.send_json(read_readiness_snapshot_history(limit))
+            return
+
+        if parsed.path == "/api/automation/task-actions":
+            query = urllib.parse.parse_qs(parsed.query)
+            try:
+                limit = int(query.get("limit", ["60"])[0])
+            except ValueError:
+                limit = 60
+            self.send_json(read_automation_task_actions(limit))
             return
 
         if parsed.path == "/api/data/status":
@@ -6114,10 +9570,36 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"error": str(exc)}, 500)
             return
 
+        if self.path == "/api/automation/preflight":
+            try:
+                body = read_json(self)
+                result = automation_run_manual_preflight(body)
+                self.send_json(result, 200 if result.get("ok") else 500)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 500)
+            return
+
+        if self.path == "/api/automation/task-action":
+            try:
+                body = read_json(self)
+                result = append_automation_task_action(body)
+                self.send_json(result, 200 if result.get("ok") else 400)
+            except Exception as exc:
+                self.send_json({"ok": False, "error": str(exc)}, 500)
+            return
+
         if self.path == "/api/execution/live-submit":
             try:
                 body = read_json(self)
                 self.send_json(submit_live_order_locked(body))
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, 500)
+            return
+
+        if self.path == "/api/execution/order-action":
+            try:
+                body = read_json(self)
+                self.send_json(execution_order_action(body))
             except Exception as exc:
                 self.send_json({"error": str(exc)}, 500)
             return
@@ -6288,6 +9770,7 @@ class Handler(BaseHTTPRequestHandler):
                         "actions": [{"type": "start", "readiness_decision": startup_readiness.get("decision") if isinstance(startup_readiness, dict) else None}],
                     }
                 )
+                record_paper_equity_snapshot(paper_state, source="start", timestamp=paper_state.updated_at)
                 save_paper_state(paper_state)
             self.send_json({"ok": True})
             return
@@ -6315,6 +9798,7 @@ class Handler(BaseHTTPRequestHandler):
                         "actions": [{"type": "stop", "position_open": position_before is not None}],
                     }
                 )
+                record_paper_equity_snapshot(paper_state, source="stop", timestamp=paper_state.updated_at)
                 save_paper_state(paper_state)
             self.send_json({"ok": True})
             return
@@ -6326,6 +9810,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    restored = load_okx_credentials_from_keychain()
+    if restored.get("loaded"):
+        print(f"OKX credentials restored from Keychain service={restored.get('service')}", flush=True)
+    with paper_lock:
+        if not paper_state.updated_at:
+            paper_state.updated_at = SERVER_STARTED_AT
+        record_paper_equity_snapshot(paper_state, source="startup", timestamp=paper_state.updated_at)
     start_task_worker()
     start_paper_loop()
     server = ThreadingHTTPServer(("127.0.0.1", 8765), Handler)

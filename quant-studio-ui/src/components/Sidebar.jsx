@@ -53,7 +53,12 @@ export default function Sidebar({ activeLabel, collapsed, theme, running, onThem
       </div>
 
       <div className="space-y-3">
-        <div className="rounded-[18px] border border-white/10 bg-white/[0.04] p-1.5">
+        <div className={`sidebar-run-summary ${running ? "is-running" : "is-stopped"}`}>
+          <span>Paper Loop</span>
+          <strong>{running ? "运行中" : "已停止"}</strong>
+          <p>{running ? "信号和模拟盘持续推进" : "不会自动推进信号"}</p>
+        </div>
+        <div className="theme-switch-shell">
           <div className="grid grid-cols-2 gap-1">
             <button
               type="button"

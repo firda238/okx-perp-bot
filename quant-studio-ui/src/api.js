@@ -10,6 +10,8 @@ export const targetStrategyParams = {
   initial_equity: 10,
   min_live_equity_usd: 10,
   live_margin_buffer_mult: 1.2,
+  max_live_order_notional_usd: 10,
+  canary_order_notional_usd: 10,
   risk_pct: 0.10,
   max_loss_pct_per_trade: 0.10,
   leverage: 75,
@@ -131,6 +133,59 @@ export function getPaperAudit(limit = 40) {
   return request(`/api/paper/audit?${query.toString()}`);
 }
 
+export function getPaperEquityHistory({ limit = 2000, start = null } = {}) {
+  const query = new URLSearchParams({ limit: String(limit) });
+  if (start) query.set("start", start);
+  return request(`/api/paper/equity-history?${query.toString()}`);
+}
+
+export function getAutomationStatus() {
+  return request("/api/automation/status");
+}
+
+export function getAutomationTaskBoard() {
+  return request("/api/automation/task-board");
+}
+
+export function getAutomationTaskActions(limit = 60) {
+  const query = new URLSearchParams({ limit: String(limit) });
+  return request(`/api/automation/task-actions?${query.toString()}`);
+}
+
+export function recordAutomationTaskAction(payload = {}) {
+  return request("/api/automation/task-action", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function getAutomationPreflightHistory(limit = 30) {
+  const query = new URLSearchParams({ limit: String(limit) });
+  return request(`/api/automation/preflight-history?${query.toString()}`);
+}
+
+export function getAutomationHeartbeatHistory(limit = 60) {
+  const query = new URLSearchParams({ limit: String(limit) });
+  return request(`/api/automation/heartbeat-history?${query.toString()}`);
+}
+
+export function getAutomationEventHistory(limit = 60) {
+  const query = new URLSearchParams({ limit: String(limit) });
+  return request(`/api/automation/event-history?${query.toString()}`);
+}
+
+export function getAutomationReadinessSnapshots(limit = 30) {
+  const query = new URLSearchParams({ limit: String(limit) });
+  return request(`/api/automation/readiness-snapshots?${query.toString()}`);
+}
+
+export function runAutomationPreflight(params = {}) {
+  return request("/api/automation/preflight", {
+    method: "POST",
+    body: JSON.stringify(params),
+  });
+}
+
 export function getDataStatus() {
   return request("/api/data/status");
 }
@@ -186,10 +241,10 @@ export function refreshDataCache(row, maxItems = 1) {
   });
 }
 
-export function refreshStaleDataCache(maxItems = 4, recommendedOnly = false) {
+export function refreshStaleDataCache(maxItems = 4, recommendedOnly = false, includeHighCost = false) {
   return request("/api/data/refresh-stale", {
     method: "POST",
-    body: JSON.stringify({ max_items: maxItems, recommended_only: recommendedOnly }),
+    body: JSON.stringify({ max_items: maxItems, recommended_only: recommendedOnly, include_high_cost: includeHighCost }),
   });
 }
 
@@ -299,6 +354,11 @@ export function getOkxDiagnostics() {
   return request("/api/okx/diagnostics");
 }
 
+export function getOkxDiagnosticsHistory(limit = 50) {
+  const query = new URLSearchParams({ limit: String(limit) });
+  return request(`/api/okx/diagnostics-history?${query.toString()}`);
+}
+
 export function setOkxSessionCredentials(payload) {
   return request("/api/okx/session-credentials", {
     method: "POST",
@@ -312,8 +372,40 @@ export function getOkxPositions(params = {}) {
   return request(`/api/okx/positions${suffix}`);
 }
 
+export async function getAi4TradeStatus(params = {}) {
+  const query = new URLSearchParams({ signals_limit: "12", news_limit: "4", category: "crypto", ...params });
+  const path = `/api/ai4trade/status?${query.toString()}`;
+  const sidecarBase = import.meta.env.VITE_AI4TRADE_API_BASE_URL || "http://127.0.0.1:8766";
+  try {
+    const response = await fetch(`${sidecarBase}${path}`, { headers: { "Content-Type": "application/json" } });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.error || `AI4Trade sidecar failed: ${response.status}`);
+    }
+    return { ...payload, sidecar: true };
+  } catch (err) {
+    try {
+      return await request(path);
+    } catch (fallbackErr) {
+      throw new Error(fallbackErr.message || err.message);
+    }
+  }
+}
+
+export function getAi4TradeHistory(limit = 50) {
+  const query = new URLSearchParams({ limit: String(limit) });
+  return request(`/api/ai4trade/history?${query.toString()}`);
+}
+
 export function submitLiveOrder(payload = {}) {
   return request("/api/execution/live-submit", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function recordExecutionOrderAction(payload = {}) {
+  return request("/api/execution/order-action", {
     method: "POST",
     body: JSON.stringify(payload),
   });

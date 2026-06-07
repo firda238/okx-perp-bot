@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { Area, AreaChart, CartesianGrid, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import GlassCard from "./GlassCard";
 
 function pct(value) {
@@ -53,6 +54,12 @@ function signedNumber(value) {
   const number = metricNumber(value);
   if (number === null) return "-";
   return `${number >= 0 ? "+" : ""}${number.toFixed(0)}`;
+}
+
+function signedMoney(value) {
+  const number = metricNumber(value);
+  if (number === null) return "-";
+  return `${number >= 0 ? "+" : ""}${money(number)}`;
 }
 
 function DeltaLine({ label, value, format = "pct", lowerIsBetter = false }) {
@@ -228,10 +235,28 @@ function ledgerEventLabel(event) {
 }
 
 function ledgerStatusTone(row = {}) {
+  const phase = row.lifecycle?.phase;
+  if (["filled", "cancelled"].includes(phase)) return "is-good";
+  if (["ack_timeout", "cancel_due", "blocked", "duplicate"].includes(phase)) return "is-bad";
+  if (["pending_ack", "open"].includes(phase)) return "is-warn";
   if (row.duplicate_intent || row.status === "duplicate" || row.status === "rejected") return "is-bad";
   if (row.status === "candidate") return "is-info";
   if (row.status === "no_intent") return "is-warn";
   return "is-info";
+}
+
+function lifecycleCheckTone(status = "") {
+  if (status === "pass") return "is-good";
+  if (status === "fail") return "is-bad";
+  if (status === "watch") return "is-warn";
+  return "is-info";
+}
+
+function lifecycleStatusLabel(status = "") {
+  if (status === "pass") return "通过";
+  if (status === "fail") return "阻断";
+  if (status === "watch") return "跟踪";
+  return "信息";
 }
 
 function guardValueLabel(row = {}) {
@@ -562,6 +587,548 @@ function dashboardSignalLabel(status = "") {
   return status || "-";
 }
 
+function accountPointTime(row = {}) {
+  return row.time || row.candle_time || row.updated_at || row.created_at || null;
+}
+
+const ACCOUNT_EQUITY_INTERVAL_MS = 15 * 60 * 1000;
+const ACCOUNT_EQUITY_ANCHOR_DATE = "2026-06-06";
+const ACCOUNT_EQUITY_ANCHOR_LABEL = `${ACCOUNT_EQUITY_ANCHOR_DATE} 00:00`;
+
+function pad2(value) {
+  return String(value).padStart(2, "0");
+}
+
+function startOfLocalDate(dateKey = ACCOUNT_EQUITY_ANCHOR_DATE) {
+  const [year, month, day] = String(dateKey).split("-").map((part) => Number(part));
+  const date = Number.isFinite(year) && Number.isFinite(month) && Number.isFinite(day)
+    ? new Date(year, month - 1, day)
+    : new Date();
+  date.setHours(0, 0, 0, 0);
+  return date;
+}
+
+function accountTimeLabel(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+  return `${pad2(date.getHours())}:${pad2(date.getMinutes())}`;
+}
+
+function accountDateTimeLabel(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+  return `${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${accountTimeLabel(date)}`;
+}
+
+function floorToAccountInterval(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return new Date(Math.floor(date.getTime() / ACCOUNT_EQUITY_INTERVAL_MS) * ACCOUNT_EQUITY_INTERVAL_MS);
+}
+
+function isPaperEquityAction(row = {}) {
+  const action = String(row.action || "");
+  if (!action) return false;
+  if (["start", "stop", "scan"].includes(action)) return true;
+  return action.includes("open") || action.includes("close") || action.includes("no_open");
+}
+
+function buildAccountEquitySeries(paperState = {}, paperAudit = {}, paperEquityHistory = {}) {
+  const rawPoints = [];
+  const historyRows = [...(paperEquityHistory?.rows || [])];
+  const historySource = paperEquityHistory?.source || "paper_loop";
+  const isOkxReadonlySource = historySource === "okx_readonly";
+  for (const row of historyRows) {
+    const equity = metricNumber(row.equity);
+    const time = row.slot || row.time || row.paper_updated_at;
+    if (equity === null || !time) continue;
+    const date = new Date(time);
+    if (Number.isNaN(date.getTime())) continue;
+    const rowSource = row.source || historySource;
+    rawPoints.push({
+      time,
+      timeMs: date.getTime(),
+      equity,
+      source: rowSource,
+      action: rowSource === "okx_readonly"
+        ? "OKX只读账户权益快照"
+        : rowSource === "start" ? "模拟盘启动快照" : rowSource === "stop" ? "模拟盘停止快照" : "15分钟持久权益快照",
+    });
+  }
+  if (!isOkxReadonlySource) {
+    const auditRows = [...(paperAudit?.rows || [])].reverse().filter(isPaperEquityAction);
+    for (const row of auditRows) {
+      const equity = metricNumber(row.equity_after ?? row.equity_before);
+      const time = accountPointTime(row);
+      if (equity === null || !time) continue;
+      const date = new Date(time);
+      if (Number.isNaN(date.getTime())) continue;
+      rawPoints.push({
+        time,
+        timeMs: date.getTime(),
+        equity,
+        source: "paper_audit",
+        action: auditActionLabel(row),
+      });
+    }
+  }
+  const historyCurrentEquity = metricNumber(paperEquityHistory?.latest?.equity);
+  const currentEquity = isOkxReadonlySource ? historyCurrentEquity : metricNumber(paperState?.equity);
+  const currentTime = paperState?.updated_at || new Date().toISOString();
+  if (!isOkxReadonlySource && currentEquity !== null) {
+    const currentDate = new Date(currentTime);
+    if (!Number.isNaN(currentDate.getTime())) {
+      const last = rawPoints[rawPoints.length - 1];
+      if (!last || last.time !== currentTime || Math.abs(Number(last.equity) - currentEquity) > 1e-9) {
+        rawPoints.push({
+          time: currentTime,
+          timeMs: currentDate.getTime(),
+          equity: currentEquity,
+          action: paperState?.running ? "运行中" : "已停止",
+        });
+      }
+    }
+  }
+  rawPoints.sort((a, b) => a.timeMs - b.timeMs);
+  const sourceLatestTime = paperEquityHistory?.latest?.slot || paperEquityHistory?.latest?.time || currentTime;
+  const nowDate = new Date(isOkxReadonlySource ? sourceLatestTime : currentTime);
+  const safeNow = Number.isNaN(nowDate.getTime()) ? new Date() : nowDate;
+  const anchorStart = startOfLocalDate(ACCOUNT_EQUITY_ANCHOR_DATE);
+  const startMs = anchorStart.getTime();
+  const endSlot = floorToAccountInterval(safeNow) || anchorStart;
+  const endMs = Math.max(startMs, endSlot.getTime());
+  const lastBeforeAnchor = [...rawPoints].reverse().find((point) => point.timeMs < startMs);
+  const firstAnchorPoint = rawPoints.find((point) => point.timeMs >= startMs);
+  const anchorDayEquity = paperState?.day_key === ACCOUNT_EQUITY_ANCHOR_DATE ? metricNumber(paperState?.day_start_equity) : null;
+  const initialEquity = metricNumber(anchorDayEquity ?? lastBeforeAnchor?.equity ?? firstAnchorPoint?.equity ?? currentEquity ?? paperState?.params?.initial_equity ?? 10) ?? 10;
+  const slotMap = new Map();
+  for (const point of rawPoints) {
+    if (point.timeMs < startMs) continue;
+    const slot = floorToAccountInterval(point.timeMs);
+    if (!slot) continue;
+    let slotMs = slot.getTime();
+    if (slotMs === startMs && point.timeMs > startMs) slotMs += ACCOUNT_EQUITY_INTERVAL_MS;
+    slotMap.set(slotMs, point);
+  }
+  const rows = [];
+  let carryEquity = initialEquity;
+  for (let slotMs = startMs; slotMs <= endMs; slotMs += ACCOUNT_EQUITY_INTERVAL_MS) {
+    const slotPoint = slotMap.get(slotMs);
+    if (slotPoint) carryEquity = slotPoint.equity;
+    const slotDate = new Date(slotMs);
+    const equity = slotMs === startMs ? initialEquity : carryEquity;
+    rows.push({
+      time: slotDate.toISOString(),
+      label: accountTimeLabel(slotDate),
+      axisLabel: accountDateTimeLabel(slotDate),
+      equity,
+      pnl: equity - initialEquity,
+      returnPct: initialEquity > 0 ? (equity - initialEquity) / initialEquity : 0,
+      source: slotPoint?.source || historySource,
+      action: slotMs === startMs ? "2026-06-06起始权益" : slotPoint?.action || "15分钟权益快照",
+    });
+  }
+  if (!rows.length) {
+    rows.push({
+      time: anchorStart.toISOString(),
+      label: accountTimeLabel(anchorStart),
+      axisLabel: accountDateTimeLabel(anchorStart),
+      equity: initialEquity,
+      pnl: 0,
+      returnPct: 0,
+      source: historySource,
+      action: "2026-06-06起始权益",
+    });
+  }
+  const latest = rows[rows.length - 1];
+  if (!isOkxReadonlySource && currentEquity !== null && Math.abs(Number(latest.equity) - currentEquity) > 1e-9) {
+    rows.push({
+      time: currentTime,
+      label: accountTimeLabel(safeNow),
+      axisLabel: accountDateTimeLabel(safeNow),
+      equity: currentEquity,
+      pnl: currentEquity - initialEquity,
+      returnPct: initialEquity > 0 ? (currentEquity - initialEquity) / initialEquity : 0,
+      source: "paper_current",
+      action: paperState?.running ? "当前权益" : "当前停止权益",
+    });
+  }
+  const latestEquity = metricNumber(rows[rows.length - 1]?.equity) ?? currentEquity ?? initialEquity;
+  return {
+    rows,
+    initialEquity,
+    currentEquity: latestEquity,
+    startLabel: ACCOUNT_EQUITY_ANCHOR_LABEL,
+    intervalLabel: "15分钟",
+    source: historySource,
+    sourceLabel: paperEquityHistory?.source_label || (isOkxReadonlySource ? "OKX只读账户权益" : "模拟盘权益"),
+    readonlyOk: Boolean(paperEquityHistory?.readonly_ok),
+    fallbackReason: paperEquityHistory?.fallback_reason,
+  };
+}
+
+function AccountEquityTooltip({ active, payload }) {
+  if (!active || !payload?.length) return null;
+  const row = payload[0].payload || {};
+  return (
+    <div className="account-equity-tooltip">
+      <strong>{row.axisLabel || row.label || "-"}</strong>
+      <span>权益 {money(row.equity)} USDT</span>
+      <span className={Number(row.pnl || 0) >= 0 ? "text-aqua" : "text-risk"}>盈亏 {signedMoney(row.pnl)} USDT · {signedPct(row.returnPct)}</span>
+      <em>{row.action || "-"}</em>
+    </div>
+  );
+}
+
+function automationPreflightStateMeta(row = {}) {
+  const state = String(row.state || "");
+  if (state.includes("error")) return { label: "错误", tone: "fail" };
+  if (state.includes("blocked")) return { label: "阻断", tone: "warn" };
+  if (state.includes("running")) return { label: "运行中", tone: "running" };
+  if (state.includes("passed") || state.includes("current")) return { label: "通过", tone: "pass" };
+  return { label: state || "等待", tone: "pending" };
+}
+
+function shadowOrderMeta(shadow = {}) {
+  const hasShadow = Boolean(shadow && typeof shadow === "object" && Object.keys(shadow).length);
+  const present = hasShadow && shadow.present !== false;
+  if (!present) {
+    return {
+      label: "等待",
+      detail: "无影子单证据",
+      badge: "is-info",
+      tone: "text-sky-300",
+    };
+  }
+  const submitted = shadow.submitted === true;
+  const wouldSubmit = shadow.would_submit === true;
+  const canSubmitLive = shadow.can_submit_live === true;
+  const dryRunOnly = shadow.dry_run_only === true;
+  const payloadReady = shadow.payload_ready === true;
+  const hasPayloadHash = Boolean(shadow.payload_sha256);
+  if (submitted || wouldSubmit || canSubmitLive) {
+    return {
+      label: "异常",
+      detail: `submitted=${submitted} · would_submit=${wouldSubmit} · can_submit_live=${canSubmitLive}`,
+      badge: "is-bad",
+      tone: "text-risk",
+    };
+  }
+  if (payloadReady && !hasPayloadHash) {
+    return {
+      label: "缺哈希",
+      detail: "payload_ready=true · payload_sha256 缺失",
+      badge: "is-warn",
+      tone: "text-sky-300",
+    };
+  }
+  if (dryRunOnly) {
+    return {
+      label: "锁定",
+      detail: hasPayloadHash ? `dry_run_only=true · hash ${String(shadow.payload_sha256).slice(0, 8)}` : "dry_run_only=true · 无需 hash",
+      badge: "is-good",
+      tone: "text-aqua",
+    };
+  }
+  return {
+    label: "待复核",
+    detail: shadow.blocked_reason || shadow.final_gate_decision || "影子单字段不完整",
+    badge: "is-warn",
+    tone: "text-sky-300",
+  };
+}
+
+function readinessSummaryTone(summary = {}) {
+  if (summary.canary_review_ready || summary.status === "canary_review_ready") return "text-aqua";
+  if (summary.readonly_ready || ["waiting_ready_signal", "manual_canary_review"].includes(summary.status)) return "text-sky-300";
+  if (summary.status === "missing_credentials" || summary.status === "readonly_failed" || summary.status === "live_lock_unsafe") return "text-risk";
+  return "text-sky-300";
+}
+
+function preLiveGateMeta(gate = {}) {
+  if (gate.status === "go" || gate.ok) return { label: "GO", badge: "is-ok", tone: "text-aqua", dot: "pass" };
+  const hasOnlyWarnings = !gate.blockers?.length && gate.warnings?.length;
+  if (hasOnlyWarnings) return { label: "WARN", badge: "is-info", tone: "text-sky-300", dot: "warn" };
+  return { label: "NO-GO", badge: "is-risk", tone: "text-risk", dot: "fail" };
+}
+
+function preLiveGateCheckSummary(gate = {}) {
+  const blocker = gate.blockers?.[0];
+  const warning = gate.warnings?.[0];
+  if (blocker) return blocker.detail || blocker.label || blocker.name || "存在阻断项";
+  if (warning) return warning.detail || warning.label || warning.name || "存在警告项";
+  return gate.next_action || "所有硬门槛通过";
+}
+
+function preLiveGateIssueLabels(gate = {}) {
+  const rows = gate.blockers?.length ? gate.blockers : gate.warnings || [];
+  return rows.map((row) => row.label || row.name || row.detail).filter(Boolean);
+}
+
+function recentBacktestMeta(recent = {}) {
+  if (!recent || !Object.keys(recent).length) {
+    return {
+      label: "等待证据",
+      detail: "还没有最近回测证据",
+      tone: "text-sky-300",
+      badge: "is-info",
+    };
+  }
+  if (recent.status === "ok" || recent.ok) {
+    return {
+      label: "已更新",
+      detail: `${dataAgeLabel(recent.age_seconds)}前生成`,
+      tone: "text-aqua",
+      badge: "is-good",
+    };
+  }
+  if (recent.status === "stale" || recent.age_ok === false) {
+    return {
+      label: "需刷新",
+      detail: `${dataAgeLabel(recent.age_seconds)}前生成`,
+      tone: "text-risk",
+      badge: "is-bad",
+    };
+  }
+  return {
+    label: "待复核",
+    detail: recent.error || recent.status || "证据状态不完整",
+    tone: "text-sky-300",
+    badge: "is-warn",
+  };
+}
+
+function AccountEquityHome({ paperState, paperAudit, paperEquityHistory, executionEnvironment, executionConfig, automationStatus, systemStatus, automationLoading, onRefreshAll, refreshAllLoading, onOpenView, onRunAutomationCheck }) {
+  const { rows, initialEquity, currentEquity, startLabel, intervalLabel, source, sourceLabel, readonlyOk, fallbackReason } = useMemo(() => buildAccountEquitySeries(paperState, paperAudit, paperEquityHistory), [paperAudit, paperEquityHistory, paperState]);
+  const peakEquity = Math.max(...rows.map((row) => Number(row.equity || 0)), currentEquity);
+  const pnl = currentEquity - initialEquity;
+  const returnPct = initialEquity > 0 ? pnl / initialEquity : 0;
+  const drawdown = peakEquity > 0 ? (currentEquity - peakEquity) / peakEquity : 0;
+  const okxEquity = metricNumber(executionEnvironment?.okx_account?.total_equity_usd);
+  const connector = executionConfig?.connector_status || {};
+  const liveLocked = Boolean(connector.dry_run_only) && !connector.can_submit_live;
+  const automationPolicy = automationStatus?.policy || {};
+  const automationLocked = Boolean(automationPolicy.dry_run_only) && !automationPolicy.can_submit_live;
+  const automationPreflight = automationStatus?.last_preflight || {};
+  const automationHeartbeat = automationStatus?.last_heartbeat || {};
+  const automationHeartbeatRows = automationStatus?.heartbeat_history?.rows || [];
+  const latestHeartbeatHistory = automationHeartbeatRows[0] || {};
+  const automationReadiness = automationStatus?.readiness || {};
+  const automationPreflightRows = automationStatus?.preflight_history?.rows || [];
+  const latestPreflightHistory = automationPreflightRows[0] || {};
+  const latestPreflightMeta = automationPreflightStateMeta(latestPreflightHistory);
+  const latestPreflightShadow = shadowOrderMeta(latestPreflightHistory.summary?.shadow_order);
+  const automationLabel = automationStatus?.state === "preflight_running"
+    ? "预检中"
+    : automationStatus?.signal_ready
+      ? automationStatus?.preflight_current ? "已预检" : "等待预检"
+      : "等待信号";
+  const automationTone = automationLocked && automationStatus?.preflight_current
+    ? "text-aqua"
+    : automationLocked
+      ? "text-sky-300"
+      : "text-risk";
+  const latestRow = rows[rows.length - 1] || {};
+  const previousRow = rows[rows.length - 2];
+  const latestDelta = previousRow ? currentEquity - Number(previousRow.equity || 0) : 0;
+  const firstLabel = rows[0]?.axisLabel || rows[0]?.label || "start";
+  const lastLabel = latestRow.axisLabel || latestRow.label || firstLabel;
+  const xTicks = [...new Set(rows.filter((_, index) => index === 0 || index === rows.length - 1 || index % 16 === 0).map((row) => row.time))];
+  const chartTone = pnl >= 0 ? "is-positive" : "is-negative";
+  const usingOkxEquity = source === "okx_readonly";
+  const minEquity = Math.min(...rows.map((row) => Number(row.equity)), initialEquity, currentEquity);
+  const maxEquity = Math.max(...rows.map((row) => Number(row.equity)), initialEquity, currentEquity, peakEquity);
+  const domainPad = Math.max((maxEquity - minEquity) * 0.15, Math.max(currentEquity, initialEquity) * 0.004, 0.05);
+  const yDomain = [Math.max(0, minEquity - domainPad), maxEquity + domainPad];
+  const persistedCount = Number(paperEquityHistory?.count ?? paperEquityHistory?.rows?.length ?? 0);
+  const recentBacktest = systemStatus?.recent_backtest || {};
+  const recentBacktestState = recentBacktestMeta(recentBacktest);
+  const recentBacktestReturn = metricNumber(recentBacktest.return_pct);
+  const recentBacktestHealth = metricNumber(recentBacktest.health_score);
+  const recentBacktestSlices = metricNumber(recentBacktest.slice_cases);
+  const recentBacktestPositiveSlices = metricNumber(recentBacktest.slice_positive_cases);
+  const keychain = systemStatus?.okx_keychain || {};
+  const okxKeychainReady = keychain.ok === true || keychain.status === "ok" || keychain.configured === true;
+  const blockerLabels = [];
+  if (!okxKeychainReady && !executionConfig?.okx_configured) blockerLabels.push("OKX Keychain缺失");
+  if (!readonlyOk && !executionEnvironment?.readonly_ready) blockerLabels.push("OKX只读未通过");
+  if (!liveLocked) blockerLabels.push("实盘锁需复核");
+  if (recentBacktest.status && recentBacktest.status !== "ok") blockerLabels.push("最近回测需刷新");
+  const firstBlocker = blockerLabels[0] || "只读观测中";
+  return (
+    <section className={`account-home ${chartTone}`}>
+      <div className="account-home-header">
+        <div>
+          <p>Account PnL Monitor</p>
+          <h2>账户收益曲线</h2>
+          <span>2026-06-06 00:00 固定起点，按 15 分钟时间槽向后延伸，持续累计账户权益变化。</span>
+        </div>
+        <div className="account-home-actions">
+          <span className={`snapshot-quality ${usingOkxEquity ? "is-good" : "is-info"}`}>{sourceLabel}</span>
+          <span className={`snapshot-quality ${paperState?.running ? "is-good" : "is-warn"}`}>{paperState?.running ? "模拟盘运行中" : "模拟盘已停止"}</span>
+          <span className={`snapshot-quality ${liveLocked ? "is-info" : "is-risk"}`}>{liveLocked ? "真实提交锁定" : "真实提交异常"}</span>
+          <button type="button" className="table-action" onClick={() => onRefreshAll?.()} disabled={refreshAllLoading}>
+            {refreshAllLoading ? "同步中..." : "刷新收益"}
+          </button>
+        </div>
+      </div>
+      <div className="account-home-hero">
+        <div>
+          <span>当前权益</span>
+          <strong>{money(currentEquity)} USDT</strong>
+          <p>2026-06-06起始 {money(initialEquity)} USDT · 最新变化 <em className={latestDelta >= 0 ? "text-aqua" : "text-risk"}>{signedMoney(latestDelta)} USDT</em></p>
+        </div>
+        <div>
+          <span>2026-06-06起累计盈亏</span>
+          <strong className={pnl >= 0 ? "text-aqua" : "text-risk"}>{signedMoney(pnl)} USDT</strong>
+          <p className={returnPct >= 0 ? "text-aqua" : "text-risk"}>{signedPct(returnPct)} from 2026-06-06</p>
+        </div>
+        <div>
+          <span>曲线坐标</span>
+          <strong>X 时间 · Y 权益</strong>
+          <p>{startLabel} 固定起点 · 每 {intervalLabel} 刷新 · 累计 {rows.length} 个权益点</p>
+        </div>
+      </div>
+      <div className="account-home-grid">
+        <div className="account-home-chart">
+          <div className="account-chart-metrics">
+            <div>
+              <span>当前权益</span>
+              <strong>{money(currentEquity)} USDT</strong>
+              <p>2026-06-06起点 {money(initialEquity)} USDT</p>
+            </div>
+            <div>
+              <span>累计盈亏</span>
+              <strong className={pnl >= 0 ? "text-aqua" : "text-risk"}>{signedMoney(pnl)} USDT</strong>
+              <p className={returnPct >= 0 ? "text-aqua" : "text-risk"}>{signedPct(returnPct)}</p>
+            </div>
+            <div>
+              <span>峰值权益</span>
+              <strong>{money(peakEquity)} USDT</strong>
+              <p className={drawdown >= -0.03 ? "text-aqua" : "text-risk"}>回撤 {signedPct(drawdown)}</p>
+            </div>
+            <div>
+              <span>历史快照</span>
+              <strong>{persistedCount}</strong>
+              <p>{persistedCount ? `${sourceLabel} · 最新 ${shortTime(paperEquityHistory?.latest?.time || paperEquityHistory?.latest?.slot)}` : "等待后端写入 15 分钟快照"}</p>
+            </div>
+          </div>
+          <div className="account-chart-frame">
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart data={rows} margin={{ top: 18, right: 18, left: 4, bottom: 10 }}>
+                <defs>
+                  <linearGradient id="accountEquityStroke" x1="0" x2="1" y1="0" y2="0">
+                    <stop offset="0%" stopColor="#21e6b5" />
+                    <stop offset="100%" stopColor="#2f80ff" />
+                  </linearGradient>
+                  <linearGradient id="accountEquityFill" x1="0" x2="0" y1="0" y2="1">
+                    <stop offset="0%" stopColor="#21e6b5" stopOpacity="0.26" />
+                    <stop offset="100%" stopColor="#2f80ff" stopOpacity="0.02" />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid stroke="rgba(180,210,255,.10)" vertical={false} />
+                <XAxis dataKey="time" ticks={xTicks} interval={0} tickFormatter={accountDateTimeLabel} tick={{ fill: "rgba(226,232,240,.58)", fontSize: 12 }} axisLine={{ stroke: "rgba(226,232,240,.16)" }} tickLine={false} minTickGap={18} />
+                <YAxis domain={yDomain} width={70} tickFormatter={(value) => `${Number(value).toFixed(2)}U`} tick={{ fill: "rgba(226,232,240,.58)", fontSize: 12 }} axisLine={{ stroke: "rgba(226,232,240,.16)" }} tickLine={false} />
+                <Tooltip content={<AccountEquityTooltip />} cursor={{ stroke: "rgba(33,230,181,.34)" }} />
+                <ReferenceLine y={initialEquity} stroke="rgba(255,255,255,.26)" strokeDasharray="4 4" />
+                <Area type="monotone" dataKey="equity" stroke="url(#accountEquityStroke)" strokeWidth={3} fill="url(#accountEquityFill)" dot={false} activeDot={{ r: 5, stroke: "#07111f", strokeWidth: 2, fill: "#21e6b5" }} />
+              </AreaChart>
+            </ResponsiveContainer>
+          </div>
+          <div className="account-axis-legend">
+            <span>Y 轴：账户权益 USDT，基准线为 2026-06-06 起始权益 {money(initialEquity)}U</span>
+            <span>X 轴：从 {startLabel} 固定开始，每 {intervalLabel} 向后延伸，当前到 {lastLabel}</span>
+          </div>
+        </div>
+        <div className="account-home-side">
+          <div>
+            <span>权益数据源</span>
+            <strong className={usingOkxEquity ? "text-aqua" : "text-sky-300"}>{sourceLabel}</strong>
+            <p>{usingOkxEquity ? "OKX只读余额已接入主页收益曲线；真实提交仍锁定。" : `暂用模拟盘权益${fallbackReason ? ` · ${fallbackReason}` : ""}`}</p>
+          </div>
+          <div className="account-home-evidence">
+            <div className="account-home-evidence-head">
+              <span>最近回测证据</span>
+              <em className={`snapshot-quality ${recentBacktestState.badge}`}>{recentBacktestState.label}</em>
+            </div>
+            <strong className={recentBacktestReturn === null ? recentBacktestState.tone : recentBacktestReturn >= 0 ? "text-aqua" : "text-risk"}>{signedPct(recentBacktestReturn)}</strong>
+            <p>{recentBacktestState.detail} · 终值 {money(recentBacktest.final_equity)}U · 交易 {recentBacktest.trades ?? "-"}</p>
+            <p className="mt-2 text-xs text-slate-500">健康 {recentBacktest.health_grade || "-"} {recentBacktestHealth === null ? "" : recentBacktestHealth.toFixed(1)} · 切片 {recentBacktestPositiveSlices ?? "-"}/{recentBacktestSlices ?? "-"}</p>
+            <p className={`mt-1 text-xs ${recentBacktest.locks_ok === false ? "text-risk" : "text-aqua"}`}>实盘锁证据 {recentBacktest.locks_ok === false ? "异常" : "保持锁定"}</p>
+          </div>
+          <div className="account-home-evidence">
+            <div className="account-home-evidence-head">
+              <span>上线阻断项</span>
+              <em className={`snapshot-quality ${blockerLabels.length ? "is-risk" : "is-info"}`}>{blockerLabels.length ? `${blockerLabels.length}项` : "只读"}</em>
+            </div>
+            <strong className={blockerLabels.length ? "text-risk" : "text-sky-300"}>{firstBlocker}</strong>
+            <p>{blockerLabels.length ? blockerLabels.slice(0, 3).join(" · ") : "当前只允许 paper loop、OKX只读和 dry-run 预演。"}</p>
+            <p className="mt-2 text-xs text-slate-500">dry_run_only={String(connector.dry_run_only)} · can_submit_live={String(connector.can_submit_live)}</p>
+          </div>
+          <div>
+            <span>运行状态</span>
+            <strong>{paperState?.running ? "正在运行" : "已停止"}</strong>
+            <p>{paperState?.updated_at ? `更新 ${shortTime(paperState.updated_at)}` : "等待模拟盘状态"}</p>
+          </div>
+          <div>
+            <span>持仓</span>
+            <strong>{paperState?.position ? `${paperState.position.side || "-"} ${money(paperState.position.notional)}U` : "空仓"}</strong>
+            <p>{paperState?.position ? `入场 ${money(paperState.position.entry)} · 止损 ${money(paperState.position.stop)}` : "当前没有模拟持仓"}</p>
+          </div>
+          <div>
+            <span>日内交易</span>
+            <strong>{paperState?.day_trades ?? 0}</strong>
+            <p>连亏 {paperState?.consecutive_losses ?? 0} · {paperState?.day_key || "等待交易日"}</p>
+          </div>
+          <div>
+            <span>自动化自检</span>
+            <strong className={automationTone}>{automationLabel}</strong>
+            <p>{automationStatus?.next_action || "ready 信号出现后自动 dry-run 预检；真实提交保持锁定。"}</p>
+            <p className="mt-2 text-xs text-slate-500">自动化阶段 {automationReadiness.label || "-"} · {automationReadiness.next_action || "等待状态"}</p>
+            <p className="mt-2 text-xs text-slate-500">最后决策 {automationPreflight.guard_decision || "-"} · 实盘 {automationLocked ? "锁定" : "需检查"}</p>
+            <p className="mt-1 text-xs text-slate-500">自检心跳 {automationHeartbeat.time ? shortTime(automationHeartbeat.time) : "-"} · {automationStatus?.heartbeat_count ?? 0} 次</p>
+            <p className="mt-1 text-xs text-slate-500">心跳历史 {automationStatus?.heartbeat_history?.count ?? automationHeartbeatRows.length} 条 · 最新 {latestHeartbeatHistory.time ? `${shortTime(latestHeartbeatHistory.time)} ${latestHeartbeatHistory.state || "-"}` : "等待记录"}</p>
+            <p className="mt-1 text-xs text-slate-500">自检历史 {automationStatus?.preflight_history?.count ?? automationPreflightRows.length} 条 · 最新 {latestPreflightHistory.time ? `${latestPreflightMeta.label} ${shortTime(latestPreflightHistory.time)}` : "等待记录"}</p>
+            <p className={`mt-1 text-xs ${latestPreflightShadow.tone}`}>影子单 {latestPreflightShadow.label} · {latestPreflightShadow.detail}</p>
+            <div className="mt-3 event-list">
+              {automationPreflightRows.slice(0, 3).length ? automationPreflightRows.slice(0, 3).map((row, index) => {
+                const meta = automationPreflightStateMeta(row);
+                const shadow = shadowOrderMeta(row.summary?.shadow_order);
+                return (
+                  <div className="event-row" key={`${row.time || index}-${row.signal_hash || index}`}>
+                    <span className={`preflight-dot is-${meta.tone}`} />
+                    <div>
+                      <strong>{row.source || "automation"} · {meta.label}</strong>
+                      <p>{shortTime(row.time)} · {row.summary?.guard_decision || row.error || row.signal?.status || "dry-run 记录"} · 影子单 {shadow.label}</p>
+                    </div>
+                  </div>
+                );
+              }) : (
+                <div className="event-row">
+                  <span className="preflight-dot is-pending" />
+                  <div>
+                    <strong>等待自检历史</strong>
+                    <p>下一次 ready 信号或手动运行自检后写入。</p>
+                  </div>
+                </div>
+              )}
+            </div>
+            <button type="button" className="mt-3 table-action" onClick={() => onRunAutomationCheck?.()} disabled={automationLoading}>
+              {automationLoading ? "自检中..." : "运行自检"}
+            </button>
+          </div>
+          <div>
+            <span>下一步</span>
+            <strong>{okxEquity === null && !readonlyOk ? "补齐OKX只读" : "保持观测"}</strong>
+            <p>{okxEquity === null && !readonlyOk ? "导入 Keychain 后自动恢复只读账户权益。" : "真实提交仍锁定，继续跑模拟盘和真实只读观测。"}</p>
+            <button type="button" className="mt-3 table-action" onClick={() => onOpenView?.("实盘")}>查看实盘锁</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 function riskUsage(value, threshold) {
   const current = metricNumber(value);
   const limit = metricNumber(threshold);
@@ -718,6 +1285,20 @@ function dataHealthStatus(score) {
   return { label: "需刷新", tone: "text-risk", badge: "is-bad" };
 }
 
+function dataEvidenceTone(status = "") {
+  if (status === "pass") return "is-good";
+  if (status === "fail") return "is-bad";
+  if (status === "info") return "is-info";
+  return "is-warn";
+}
+
+function dataEvidenceLabel(status = "") {
+  if (status === "pass") return "通过";
+  if (status === "fail") return "阻断";
+  if (status === "info") return "跟踪";
+  return "关注";
+}
+
 function taskTypeLabel(type = "") {
   const labels = {
     data_refresh: "数据刷新",
@@ -745,6 +1326,29 @@ function taskStatusTone(status = "") {
   if (status === "running" || status === "queued") return "is-info";
   if (status === "cancelled") return "is-warn";
   return "is-bad";
+}
+
+function taskIsRetryable(task = {}) {
+  const failed = task.status === "failed" || task.error || Number(task.result?.failed || 0) > 0;
+  return failed && ["data_refresh", "compact_cache"].includes(task.type);
+}
+
+function taskRetryParams(task = {}, batchSize = 4) {
+  const params = { ...(task.params || {}) };
+  if (task.type === "data_refresh") {
+    return {
+      stale: true,
+      max_items: batchSize,
+      ...params,
+    };
+  }
+  if (task.type === "compact_cache") {
+    return {
+      dry_run: false,
+      ...params,
+    };
+  }
+  return params;
 }
 
 function taskProgressLabel(task = {}) {
@@ -849,7 +1453,19 @@ function TaskDetailPanel({ task }) {
   if (!task) {
     return (
       <div className="task-detail-panel">
+        <div className="task-detail-header">
+          <div>
+            <span>任务详情</span>
+            <h4>等待任务</h4>
+            <p>当前没有后台任务记录。</p>
+          </div>
+          <span className="snapshot-quality is-info">空闲</span>
+        </div>
         <div className="task-detail-empty">选择一个后台任务查看参数、进度和结果摘要。</div>
+        <div className="ledger-json-panel">
+          <span>Task Raw JSON</span>
+          <pre>{JSON.stringify({ selected: null }, null, 2)}</pre>
+        </div>
       </div>
     );
   }
@@ -912,6 +1528,9 @@ function TaskDetailPanel({ task }) {
           type: task.type,
           status: task.status,
           params,
+          fingerprint: task.fingerprint,
+          deduped_count: task.deduped_count,
+          deduped_at: task.deduped_at,
           progress,
           result: task.result,
           error: task.error,
@@ -930,15 +1549,19 @@ export function DashboardView({
   executionPlan,
   executionConfig,
   executionEnvironment,
+  automationStatus,
+  systemStatus,
   okxDiagnostics,
   dataStatus,
   paperAudit,
+  paperEquityHistory,
   refreshAllLoading,
   signalScanLoading,
   preflightLoading,
   onRefreshAll,
   onOpenView,
   onRunSignalScan,
+  onRunAutomationCheck,
   onRunLivePreflight,
 }) {
   const latest = latestCandle(candles);
@@ -953,6 +1576,14 @@ export function DashboardView({
   const preflight = preflightSummary(executionPlan, okxDiagnostics, executionConfig);
   const submitPath = liveSubmitPath(executionPlan, executionConfig, okxDiagnostics, executionEnvironment);
   const recentAuditRows = paperAudit?.rows || [];
+  const automationPolicy = automationStatus?.policy || {};
+  const automationLiveLocked = Boolean(automationPolicy.dry_run_only) && !automationPolicy.can_submit_live;
+  const automationReadiness = automationStatus?.readiness || {};
+  const automationStateLabel = automationStatus?.state === "preflight_running"
+    ? "预检中"
+    : automationStatus?.signal_ready
+      ? automationStatus?.preflight_current ? "已预检" : "待预检"
+      : "等待信号";
   const branchRows = [
     {
       name: "市场",
@@ -1009,6 +1640,14 @@ export function DashboardView({
       loading: preflightLoading,
     },
     {
+      title: "自动化自检",
+      detail: `${automationStateLabel} · ${automationStatus?.next_action || "ready 后自动 dry-run"}`,
+      action: "运行自检",
+      view: "仪表盘",
+      onClick: onRunAutomationCheck,
+      loading: preflightLoading,
+    },
+    {
       title: "数据维护",
       detail: staleRows.length ? `${staleRows.length} 个陈旧缓存，${recommendedRows.length} 个建议刷新。` : "K 线缓存当前没有明显陈旧项。",
       action: "打开数据",
@@ -1017,12 +1656,28 @@ export function DashboardView({
     },
   ];
   return (
-    <ViewShell title="仪表盘" subtitle="项目运行驾驶舱，汇总行情、策略、回测、风控、实盘和数据状态。">
-      <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
+    <div className="dashboard-home">
+      <AccountEquityHome
+        paperState={paperState}
+        paperAudit={paperAudit}
+        paperEquityHistory={paperEquityHistory}
+        executionEnvironment={executionEnvironment}
+        executionConfig={executionConfig}
+        automationStatus={automationStatus}
+        systemStatus={systemStatus}
+        automationLoading={preflightLoading}
+        refreshAllLoading={refreshAllLoading}
+        onRefreshAll={onRefreshAll}
+        onOpenView={onOpenView}
+        onRunAutomationCheck={onRunAutomationCheck}
+      />
+      <div className="dashboard-branch-header">
+        <div>
+          <p>Workspace Status</p>
+          <h3>后续工作区</h3>
+          <span>行情、策略、回测、风控、实盘和数据维护都放在收益主页之后。</span>
+        </div>
         <div className="flex flex-wrap gap-2">
-          <button type="button" className="table-action" onClick={() => onRefreshAll?.()} disabled={refreshAllLoading}>
-            {refreshAllLoading ? "刷新中..." : "刷新总览"}
-          </button>
           <button type="button" className="table-action" onClick={() => onOpenView?.("实盘")}>实盘门槛</button>
           <button type="button" className="table-action" onClick={() => onOpenView?.("回测")}>交易复盘</button>
         </div>
@@ -1032,6 +1687,8 @@ export function DashboardView({
         <StatCell label="模拟盘" value={paperState?.running ? "运行中" : "已停止"} note={`权益 ${money(paperState?.equity)}U · 日内 ${paperState?.day_trades ?? 0}`} tone={paperState?.running ? "text-aqua" : "text-sky-300"} />
         <StatCell label="回测健康" value={`${health.grade || "-"} ${Number.isFinite(Number(health.score)) ? Number(health.score).toFixed(0) : ""}`} note={`收益 ${pct(summary.return_pct)} · 交易 ${summary.trades ?? 0}`} tone={Number(health.score || 0) >= 62 ? "text-aqua" : "text-risk"} />
         <StatCell label="当前信号" value={dashboardSignalLabel(signalScan.status)} note={signalScan.reasons?.[0] || signalScan.decision || "等待扫描"} tone={signalScan.status === "ready" ? "text-aqua" : signalScan.status === "blocked" ? "text-risk" : "text-sky-300"} />
+        <StatCell label="自动化自检" value={automationStateLabel} note={automationStatus?.last_preflight?.guard_decision || automationStatus?.next_action || "ready 后自动 dry-run"} tone={automationLiveLocked ? "text-aqua" : "text-risk"} />
+        <StatCell label="自动化阶段" value={automationReadiness.label || "-"} note={automationReadiness.next_action || "等待状态"} tone={automationReadiness.stage === "manual_canary_review" ? "text-aqua" : automationReadiness.stage === "missing_credentials" ? "text-risk" : "text-sky-300"} />
         <StatCell label="实盘路径" value={submitPath.label} note={submitPath.note} tone={submitPath.tone} />
         <StatCell label="数据缓存" value={`${dataRows.length - staleRows.length}/${dataRows.length || 0}`} note={`${recommendedRows.length} 建议刷新 · ${staleRows.length} 陈旧`} tone={staleRows.length ? "text-risk" : "text-aqua"} />
       </div>
@@ -1096,7 +1753,7 @@ export function DashboardView({
           </div>
         </div>
       </div>
-    </ViewShell>
+    </div>
   );
 }
 
@@ -1796,14 +2453,18 @@ export function DataView({
   const recommendedDataCount = rows.filter((row) => row.recommended_refresh).length;
   const compactableRows = rows.filter((row) => row.covered_by_fresh_cache && row.is_stale);
   const compactableKb = Math.round(compactableRows.reduce((sum, row) => sum + Number(row.size_bytes || 0), 0) / 1024);
-  const uncoveredStaleRows = rows.filter((row) => row.is_stale && !row.covered_by_fresh_cache);
+  const highCostManualRows = rows.filter((row) => row.is_stale && row.high_refresh_cost && !row.covered_by_fresh_cache);
+  const autoStaleRows = rows.filter((row) => row.is_stale && !row.covered_by_fresh_cache && !row.high_refresh_cost);
   const refreshQueue = [...rows]
-    .filter((row) => row.recommended_refresh || (row.is_stale && !row.covered_by_fresh_cache))
+    .filter((row) => row.recommended_refresh || (row.is_stale && !row.covered_by_fresh_cache && !row.high_refresh_cost))
     .sort((left, right) => {
       const priorityDiff = Number(right.refresh_priority || 0) - Number(left.refresh_priority || 0);
       if (priorityDiff) return priorityDiff;
       return Number(left.refresh_estimated_requests || 1) - Number(right.refresh_estimated_requests || 1);
     });
+  const topHighCostManualRows = [...highCostManualRows]
+    .sort((left, right) => Number(right.refresh_estimated_requests || 1) - Number(left.refresh_estimated_requests || 1))
+    .slice(0, dataRefreshBatchSize);
   const topRefreshQueue = refreshQueue.slice(0, dataRefreshBatchSize);
   const estimatedRequests = topRefreshQueue.reduce((sum, row) => sum + Number(row.refresh_estimated_requests || 1), 0);
   const oldestRow = rows.reduce((oldest, row) => {
@@ -1817,6 +2478,13 @@ export function DataView({
   const healthScore = dataHealthScore(rows);
   const healthStatus = dataHealthStatus(healthScore);
   const activeTasks = tasks.filter((task) => ["queued", "running"].includes(task.status));
+  const failedTasks = tasks.filter((task) => (
+    task.status === "failed" || task.error || Number(task.result?.failed || 0) > 0
+  ));
+  const retryableTasks = failedTasks.filter(taskIsRetryable);
+  const retryTask = retryableTasks[0] || null;
+  const retryTaskParams = retryTask ? taskRetryParams(retryTask, dataRefreshBatchSize) : null;
+  const dedupedTaskCount = tasks.reduce((sum, task) => sum + Number(task.deduped_count || 0), 0);
   const clearableTasks = tasks.filter((task) => ["completed", "failed", "cancelled"].includes(task.status));
   const latestTask = tasks[0];
   const selectedTask = tasks.find((task) => task.id === selectedTaskId) || latestTask || null;
@@ -1824,8 +2492,10 @@ export function DataView({
     ? `优先刷新 ${recommendedDataCount} 个建议项`
     : compactableRows.length > 0
       ? `可压缩 ${compactableRows.length} 个覆盖缓存`
-      : uncoveredStaleRows.length > 0
-        ? `复核 ${uncoveredStaleRows.length} 个陈旧缓存`
+      : autoStaleRows.length > 0
+        ? `复核 ${autoStaleRows.length} 个常规陈旧缓存`
+        : highCostManualRows.length > 0
+          ? `${highCostManualRows.length} 个手动长刷新项`
         : "保持当前缓存";
   const visibleSnapshots = useMemo(() => {
     const filtered = snapshots.filter((row) => {
@@ -1840,11 +2510,16 @@ export function DataView({
     if (dataFilter === "fresh") return !row.is_stale;
     if (dataFilter === "stale") return row.is_stale;
     if (dataFilter === "recommended") return row.recommended_refresh;
+    if (dataFilter === "manual") return row.is_stale && row.high_refresh_cost && !row.covered_by_fresh_cache;
     return true;
   }).sort((left, right) => {
-    if (dataFilter === "recommended") {
+    if (dataFilter === "recommended" || dataFilter === "manual") {
       const priorityDiff = Number(right.refresh_priority || 0) - Number(left.refresh_priority || 0);
       if (priorityDiff) return priorityDiff;
+      if (dataFilter === "manual") {
+        const costDiff = Number(right.refresh_estimated_requests || 1) - Number(left.refresh_estimated_requests || 1);
+        if (costDiff) return costDiff;
+      }
       const countDiff = Number(left.count || left.candles || 0) - Number(right.count || right.candles || 0);
       if (countDiff) return countDiff;
       return `${left.inst_id || ""}-${left.bar || ""}`.localeCompare(`${right.inst_id || ""}-${right.bar || ""}`);
@@ -1859,6 +2534,137 @@ export function DataView({
     `${row.inst_id || "-"} ${row.bar || "-"} ${row.count || "-"}`
   )).join(" · "), [dataCompactResult]);
   const activeRefreshProgress = dataRefreshLoading ? dataRefreshProgress : dataRefreshResult?.progress;
+  const latestRefreshResult = dataRefreshResult || tasks.find((task) => task.type === "data_refresh" && task.result)?.result || null;
+  const refreshFailures = Number(
+    activeRefreshProgress?.failed ?? latestRefreshResult?.failed ?? 0
+  );
+  const refreshSuccess = Number(
+    activeRefreshProgress?.ok ?? latestRefreshResult?.ok ?? 0
+  );
+  const refreshSkippedByLock = Boolean(latestRefreshResult?.skipped_due_to_active_refresh);
+  const refreshLockActive = Boolean(activeRefreshProgress?.active || refreshSkippedByLock);
+  const portfolioCache = dataStatus?.portfolio_result_cache || {};
+  const portfolioCacheItems = Number(portfolioCache.items || 0);
+  const portfolioCacheMax = Number(portfolioCache.max_items || 0);
+  const portfolioCacheUsage = portfolioCacheMax ? portfolioCacheItems / portfolioCacheMax : 0;
+  const maintenanceEvidenceRows = [
+    {
+      name: "刷新队列",
+      value: `${topRefreshQueue.length}/${refreshQueue.length}`,
+      threshold: `x${dataRefreshBatchSize} 批次`,
+      status: refreshQueue.length ? "watch" : "pass",
+      action: refreshQueue.length
+        ? `先处理 ${topRefreshQueue[0]?.inst_id || "-"} ${topRefreshQueue[0]?.bar || ""}`
+        : "暂无刷新队列",
+    },
+    {
+      name: "未覆盖陈旧",
+      value: String(autoStaleRows.length),
+      threshold: "0",
+      status: autoStaleRows.length ? "fail" : "pass",
+      action: autoStaleRows.length ? "刷新常规陈旧缓存或扩大历史窗口" : "没有常规硬阻断",
+    },
+    {
+      name: "手动长刷新",
+      value: String(highCostManualRows.length),
+      threshold: `>${dataStatus?.summary?.max_auto_refresh_estimated_requests ?? "-"} 请求`,
+      status: highCostManualRows.length ? "info" : "pass",
+      action: highCostManualRows.length ? "不进自动批次，按需单条刷新" : "无高成本手动项",
+    },
+    {
+      name: "推荐刷新",
+      value: String(recommendedDataCount),
+      threshold: "0",
+      status: recommendedDataCount ? "watch" : "pass",
+      action: recommendedDataCount ? "刷新推荐批次" : "保持观察",
+    },
+    {
+      name: "覆盖压缩",
+      value: `${compactableRows.length} 项`,
+      threshold: `约 ${compactableKb} KB`,
+      status: compactableRows.length ? "info" : "pass",
+      action: compactableRows.length ? "先预览再压缩覆盖缓存" : "无需压缩",
+    },
+    {
+      name: "刷新失败",
+      value: String(refreshFailures),
+      threshold: "0",
+      status: refreshFailures ? "fail" : "pass",
+      action: refreshFailures ? "查看任务详情和错误返回" : `${refreshSuccess} 项刷新成功`,
+    },
+    {
+      name: "刷新运行锁",
+      value: refreshLockActive ? "占用" : "空闲",
+      threshold: "单批执行",
+      status: refreshLockActive ? "info" : "pass",
+      action: refreshSkippedByLock ? "重复刷新已跳过，等待活跃批次" : refreshLockActive ? "等待当前批次完成" : "可提交刷新",
+    },
+    {
+      name: "后台任务",
+      value: `${activeTasks.length} 活跃 / ${failedTasks.length} 异常`,
+      threshold: "0 异常",
+      status: failedTasks.length ? "fail" : activeTasks.length ? "info" : "pass",
+      action: failedTasks.length
+        ? `可重试 ${retryableTasks.length} 个刷新/压缩任务`
+        : activeTasks.length ? "等待任务完成" : "队列空闲",
+    },
+    {
+      name: "队列去重",
+      value: `${dedupedTaskCount} 次`,
+      threshold: "活跃任务复用",
+      status: dedupedTaskCount ? "info" : "pass",
+      action: dedupedTaskCount ? "重复提交已复用现有任务" : "没有重复提交",
+    },
+    {
+      name: "快照候选",
+      value: `${candidateCount}/${snapshots.length}`,
+      threshold: ">=1",
+      status: candidateCount ? "pass" : "watch",
+      action: candidateCount ? "可用于回测基准对照" : "先保存研究快照",
+    },
+    {
+      name: "结果缓存",
+      value: portfolioCacheMax ? `${portfolioCacheItems}/${portfolioCacheMax}` : String(portfolioCacheItems),
+      threshold: portfolioCacheMax ? "<85%" : "可用",
+      status: portfolioCacheUsage >= 0.85 ? "watch" : "pass",
+      action: portfolioCacheUsage >= 0.85 ? "关注缓存淘汰和重复计算" : `${portfolioCache.ttl_seconds ?? 0}s TTL`,
+    },
+  ];
+  const maintenanceBlocked = maintenanceEvidenceRows.filter((row) => row.status === "fail").length;
+  const maintenanceWatching = maintenanceEvidenceRows.filter((row) => row.status === "watch").length;
+  const maintenancePayload = {
+    status: maintenanceBlocked ? "blocked" : maintenanceWatching ? "watch" : "pass",
+    health_score: healthScore,
+    refresh_queue: refreshQueue.slice(0, dataRefreshBatchSize).map((row) => ({
+      inst_id: row.inst_id,
+      bar: row.bar,
+      count: row.count || row.candles,
+      priority: row.refresh_priority,
+      estimated_requests: row.refresh_estimated_requests,
+      reasons: row.refresh_reasons,
+    })),
+    high_cost_manual_refresh: highCostManualRows.slice(0, dataRefreshBatchSize).map((row) => ({
+      inst_id: row.inst_id,
+      bar: row.bar,
+      count: row.count || row.candles,
+      estimated_requests: row.refresh_estimated_requests,
+      cost_label: row.refresh_cost_label,
+      reasons: row.refresh_reasons,
+    })),
+    evidence: maintenanceEvidenceRows,
+    failures: failedTasks.slice(0, 5).map((task) => ({
+      id: task.id,
+      type: task.type,
+      status: task.status,
+      deduped_count: task.deduped_count,
+      failed: task.result?.failed,
+      error: task.error,
+      updated_at: task.updated_at || task.created_at,
+    })),
+    latest_refresh_result: latestRefreshResult,
+    active_refresh: activeRefreshProgress,
+    cache: portfolioCache,
+  };
   const selectedDataRow = visibleDataRows.find((row) => dataRowKey(row) === selectedDataKey) || visibleDataRows[0] || null;
   const sortLabel = SNAPSHOT_SORTS[sortState.key]?.label || "时间";
   const toggleSort = (key) => {
@@ -1872,7 +2678,8 @@ export function DataView({
     <ViewShell title="数据" subtitle="本地 K 线缓存、组合回测结果缓存和数据新鲜度。">
       <div className="risk-grid">
         <StatCell label="K 线缓存文件" value={String(dataStatus?.files ?? "-")} note={dataStatus?.cache_dir || "-"} />
-        <StatCell label="K 线新鲜度" value={`${freshDataCount}/${rows.length || 0}`} note={`${recommendedDataCount} 建议刷新 · ${staleDataCount} 陈旧`} tone={staleDataCount ? "text-risk" : "text-aqua"} />
+        <StatCell label="K 线新鲜度" value={`${freshDataCount}/${rows.length || 0}`} note={`${recommendedDataCount} 建议刷新 · ${staleDataCount} 陈旧`} tone={autoStaleRows.length || recommendedDataCount ? "text-risk" : "text-aqua"} />
+        <StatCell label="手动长刷新" value={String(highCostManualRows.length)} note={highCostManualRows.length ? `最高 ${topHighCostManualRows[0]?.refresh_cost_label || "-"}` : "未发现高成本项"} tone={highCostManualRows.length ? "text-sky-300" : "text-slate-400"} />
         <StatCell label="可压缩缓存" value={String(compactableRows.length)} note={`约 ${compactableKb} KB · 覆盖复用`} tone={compactableRows.length ? "text-aqua" : "text-slate-400"} />
         <StatCell label="结果缓存" value={`${dataStatus?.portfolio_result_cache?.items ?? 0}/${dataStatus?.portfolio_result_cache?.max_items ?? 0}`} note={`${dataStatus?.portfolio_result_cache?.ttl_seconds ?? 0}s TTL`} />
         <StatCell label="研究快照" value={String(snapshots.length)} note={`${candidateCount} 候选 · ${fullCount} 全量 · ${quickCount} 快照`} />
@@ -1898,8 +2705,13 @@ export function DataView({
           </div>
           <div>
             <span>未覆盖陈旧</span>
-            <strong className={uncoveredStaleRows.length ? "text-risk" : "text-aqua"}>{uncoveredStaleRows.length}</strong>
-            <p>{uncoveredStaleRows.length ? "会影响回测或扫描新鲜度" : "陈旧项均可覆盖或不存在"}</p>
+            <strong className={autoStaleRows.length ? "text-risk" : "text-aqua"}>{autoStaleRows.length}</strong>
+            <p>{autoStaleRows.length ? "常规批量刷新会处理" : "没有常规硬阻断"}</p>
+          </div>
+          <div>
+            <span>手动长刷新</span>
+            <strong className={highCostManualRows.length ? "text-sky-300" : "text-aqua"}>{highCostManualRows.length}</strong>
+            <p>{highCostManualRows.length ? "不进入自动刷新批次" : "没有高成本陈旧项"}</p>
           </div>
           <div>
             <span>覆盖压缩</span>
@@ -1913,6 +2725,10 @@ export function DataView({
           </button>
           <button type="button" className="table-action" onClick={() => setDataFilter("recommended")} disabled={recommendedDataCount === 0}>查看建议项</button>
           <button type="button" className="table-action" onClick={() => setDataFilter("stale")} disabled={staleDataCount === 0}>查看陈旧项</button>
+          <button type="button" className="table-action" onClick={() => setDataFilter("manual")} disabled={highCostManualRows.length === 0}>查看手动长刷新</button>
+          <button type="button" className="table-action" onClick={() => onRefreshDataCache?.(null, false, true)} disabled={dataRefreshLoading || highCostManualRows.length === 0}>
+            {dataRefreshLoading ? "刷新中..." : "长刷新手动项"}
+          </button>
           <button type="button" className="table-action" onClick={() => onCompactDataCache?.(true)} disabled={dataCompactLoading || compactableRows.length === 0}>
             {dataCompactLoading ? "压缩中..." : "预览压缩"}
           </button>
@@ -1936,6 +2752,83 @@ export function DataView({
               )}
             </tbody>
           </table>
+        </div>
+      </div>
+      <div className="mt-5 analysis-card data-health-panel">
+        <div className="data-health-header">
+          <div>
+            <span>MAINTENANCE EVIDENCE</span>
+            <h3>维护证据矩阵</h3>
+            <p>{maintenanceBlocked ? `${maintenanceBlocked} 个阻断项需要先处理` : maintenanceWatching ? `${maintenanceWatching} 个关注项，维护可继续` : "缓存、任务和快照状态可继续执行。"} · 可重试 {retryableTasks.length} 个任务</p>
+          </div>
+          <div className="data-health-score">
+            <span className={`snapshot-quality ${maintenanceBlocked ? "is-bad" : maintenanceWatching ? "is-warn" : "is-good"}`}>
+              {maintenanceBlocked ? "需处理" : maintenanceWatching ? "关注" : "通过"}
+            </span>
+            <strong className={maintenanceBlocked ? "text-risk" : maintenanceWatching ? "text-sky-300" : "text-aqua"}>{maintenanceEvidenceRows.length - maintenanceBlocked}</strong>
+          </div>
+        </div>
+        <div className="data-health-grid">
+          <div>
+            <span>待刷新</span>
+            <strong>{refreshQueue.length}</strong>
+            <p>本批 {topRefreshQueue.length} 项 · 约 {estimatedRequests} 次请求</p>
+          </div>
+          <div>
+            <span>手动长刷新</span>
+            <strong className={highCostManualRows.length ? "text-sky-300" : "text-aqua"}>{highCostManualRows.length}</strong>
+            <p>{topHighCostManualRows.length ? `${topHighCostManualRows[0]?.inst_id || "-"} ${topHighCostManualRows[0]?.bar || ""}` : "无高成本项"}</p>
+          </div>
+          <div>
+            <span>可压缩</span>
+            <strong>{compactableRows.length}</strong>
+            <p>覆盖缓存约 {compactableKb} KB</p>
+          </div>
+          <div>
+            <span>失败任务</span>
+            <strong className={failedTasks.length ? "text-risk" : "text-aqua"}>{failedTasks.length}</strong>
+            <p>{retryableTasks.length ? `可重试 ${retryableTasks.length} 个` : "无刷新/压缩失败任务"}</p>
+          </div>
+        </div>
+        <div className="data-health-actions">
+          <button type="button" className="table-action" onClick={() => onRefreshDataCache?.(null, true)} disabled={dataRefreshLoading || recommendedDataCount === 0}>
+            {dataRefreshLoading ? "刷新中..." : "刷新推荐批次"}
+          </button>
+          <button type="button" className="table-action" onClick={() => onStartTask?.("data_refresh", { stale: true, max_items: dataRefreshBatchSize, recommended_only: false })} disabled={taskLoading || staleDataCount === 0}>
+            {taskLoading ? "提交中..." : "后台刷新陈旧缓存"}
+          </button>
+          <button type="button" className="table-action" onClick={() => onStartTask?.("data_refresh", { stale: true, max_items: dataRefreshBatchSize, recommended_only: false, include_high_cost: true })} disabled={taskLoading || highCostManualRows.length === 0}>
+            {taskLoading ? "提交中..." : "后台长刷新高成本"}
+          </button>
+          <button type="button" className="table-action" onClick={() => onCompactDataCache?.(true)} disabled={dataCompactLoading || compactableRows.length === 0}>
+            {dataCompactLoading ? "压缩中..." : "预览覆盖压缩"}
+          </button>
+          <button type="button" className="table-action" onClick={() => retryTask && onStartTask?.(retryTask.type, retryTaskParams)} disabled={taskLoading || !retryTask}>
+            {taskLoading ? "提交中... · " : ""}{retryTask ? `重试最近失败 · ${taskTypeLabel(retryTask.type)}` : "重试最近失败"}
+          </button>
+          <button type="button" className="table-action" onClick={() => onRefreshTasks?.()} disabled={taskLoading}>
+            {taskLoading ? "刷新中..." : "刷新任务状态"}
+          </button>
+        </div>
+        <div className="overflow-x-auto rounded-[18px] border border-white/10">
+          <table className="trade-table">
+            <thead><tr><th>证据</th><th>当前值</th><th>门槛/用途</th><th>状态</th><th>动作</th></tr></thead>
+            <tbody>
+              {maintenanceEvidenceRows.map((row) => (
+                <tr key={row.name}>
+                  <td>{row.name}</td>
+                  <td>{row.value}</td>
+                  <td>{row.threshold}</td>
+                  <td><span className={`snapshot-quality ${dataEvidenceTone(row.status)}`}>{dataEvidenceLabel(row.status)}</span></td>
+                  <td>{row.action}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div className="ledger-json-panel">
+          <span>Data Maintenance JSON</span>
+          <pre>{JSON.stringify(maintenancePayload, null, 2)}</pre>
         </div>
       </div>
       <div className="mt-5 analysis-card data-health-panel">
@@ -1972,6 +2865,14 @@ export function DataView({
           <button
             type="button"
             className="table-action"
+            onClick={() => onStartTask?.("data_refresh", { stale: true, max_items: dataRefreshBatchSize, recommended_only: false, include_high_cost: true })}
+            disabled={taskLoading || highCostManualRows.length === 0}
+          >
+            {taskLoading ? "提交中..." : `后台长刷新 x${dataRefreshBatchSize}`}
+          </button>
+          <button
+            type="button"
+            className="table-action"
             onClick={() => onStartTask?.("compact_cache", { dry_run: false })}
             disabled={taskLoading || compactableRows.length === 0}
           >
@@ -1993,6 +2894,7 @@ export function DataView({
                 const current = progress.current || {};
                 const total = Number(progress.total || 0);
                 const completed = Number(progress.completed || 0);
+                const canRetryTask = taskIsRetryable(task);
                 return (
                   <tr key={task.id} className={selectedTask?.id === task.id ? "is-selected-row" : ""}>
                     <td>{taskTypeLabel(task.type)}</td>
@@ -2000,12 +2902,17 @@ export function DataView({
                     <td>{total ? `${completed}/${total}` : "-"}</td>
                     <td>{current.inst_id ? `${current.inst_id} ${current.bar || ""} ${current.count || ""}` : task.params?.recommended_only ? "建议项" : "-"}</td>
                     <td>{(task.updated_at || task.created_at || "").replace("T", " ").slice(0, 19) || "-"}</td>
-                    <td>{task.error || (task.result ? "已有结果" : "-")}</td>
+                    <td>{Number(task.deduped_count || 0) ? `复用 ${task.deduped_count} 次` : task.error || (task.result ? "已有结果" : "-")}</td>
                     <td>
                       <div className="table-actions">
                         <button type="button" className="table-action" onClick={() => setSelectedTaskId(task.id)}>详情</button>
                         {["queued", "running"].includes(task.status) ? (
                           <button type="button" className="table-action" onClick={() => onCancelTask?.(task.id)} disabled={taskLoading}>取消</button>
+                        ) : null}
+                        {canRetryTask ? (
+                          <button type="button" className="table-action" onClick={() => onStartTask?.(task.type, taskRetryParams(task, dataRefreshBatchSize))} disabled={taskLoading}>
+                            {taskLoading ? "提交中" : "重试"}
+                          </button>
                         ) : null}
                       </div>
                     </td>
@@ -2102,6 +3009,7 @@ export function DataView({
           {[
             ["all", "全部缓存"],
             ["recommended", "建议刷新"],
+            ["manual", "手动长刷新"],
             ["fresh", "新鲜"],
             ["stale", "陈旧"],
           ].map(([key, label]) => (
@@ -2116,6 +3024,9 @@ export function DataView({
         <button type="button" className="table-action" onClick={() => onRefreshDataCache?.()} disabled={dataRefreshLoading || staleDataCount === 0}>
           {dataRefreshLoading ? "刷新中..." : `刷新陈旧缓存 x${dataRefreshBatchSize}`}
         </button>
+        <button type="button" className="table-action" onClick={() => onRefreshDataCache?.(null, false, true)} disabled={dataRefreshLoading || highCostManualRows.length === 0}>
+          {dataRefreshLoading ? "刷新中..." : `长刷新手动 x${dataRefreshBatchSize}`}
+        </button>
         <button type="button" className="table-action" onClick={() => onCompactDataCache?.(true)} disabled={dataCompactLoading || compactableRows.length === 0}>
           {dataCompactLoading ? "压缩中..." : "预览压缩"}
         </button>
@@ -2129,13 +3040,13 @@ export function DataView({
             </button>
           ))}
         </div>
-        <p>{visibleDataRows.length}/{rows.length} · 建议 {recommendedDataCount} · 新鲜 {freshDataCount} · 陈旧 {staleDataCount}</p>
+        <p>{visibleDataRows.length}/{rows.length} · 建议 {recommendedDataCount} · 手动 {highCostManualRows.length} · 新鲜 {freshDataCount} · 陈旧 {staleDataCount}</p>
       </div>
       {dataRefreshResult ? (
         <div className="data-refresh-result">
-          <span>{dataRefreshResult.failed ? "部分刷新失败" : "刷新完成"}</span>
-          <strong>{dataRefreshResult.ok ?? 0} 成功 / {dataRefreshResult.failed ?? 0} 失败 / {dataRefreshResult.skipped_covered ?? 0} 覆盖跳过</strong>
-          <p>{refreshResultPreview || "无结果"}</p>
+          <span>{dataRefreshResult.skipped_due_to_active_refresh ? "刷新已跳过" : dataRefreshResult.failed ? "部分刷新失败" : "刷新完成"}</span>
+          <strong>{dataRefreshResult.ok ?? 0} 成功 / {dataRefreshResult.failed ?? 0} 失败 / {dataRefreshResult.skipped_covered ?? 0} 覆盖跳过 / {dataRefreshResult.skipped_high_cost ?? 0} 高成本跳过</strong>
+          <p>{dataRefreshResult.skipped_due_to_active_refresh ? `已有批次 ${dataRefreshResult.active_refresh?.batch_id || "-"} 正在执行` : refreshResultPreview || "无结果"}</p>
         </div>
       ) : null}
       {dataCompactResult ? (
@@ -2162,10 +3073,10 @@ export function DataView({
                 <td>{row.bar}</td>
                 <td>{row.candles}</td>
                 <td>{row.latest_closed?.replace("T", " ").slice(0, 16) || "-"}</td>
-                <td className={row.is_stale ? row.covered_by_fresh_cache ? "text-aqua" : "text-risk" : "text-aqua"}>{row.is_stale ? row.covered_by_fresh_cache ? "已覆盖" : "陈旧" : "新鲜"}</td>
-                <td><span className={`snapshot-quality ${row.recommended_refresh ? "is-warn" : row.is_stale ? "is-info" : "is-good"}`}>{row.refresh_priority ?? 0}</span></td>
+                <td className={row.is_stale ? row.covered_by_fresh_cache ? "text-aqua" : row.high_refresh_cost ? "text-sky-300" : "text-risk" : "text-aqua"}>{row.is_stale ? row.covered_by_fresh_cache ? "已覆盖" : row.high_refresh_cost ? "手动长刷新" : "陈旧" : "新鲜"}</td>
+                <td><span className={`snapshot-quality ${row.recommended_refresh ? "is-warn" : row.high_refresh_cost ? "is-info" : row.is_stale ? "is-info" : "is-good"}`}>{row.refresh_priority ?? 0}</span></td>
                 <td>{row.refresh_reasons?.join(" / ") || "-"}</td>
-                <td>{row.coverage_note || `${row.refresh_cost_label || "-"} · 阈值 ${row.stale_after_minutes || "-"}m`}</td>
+                <td>{row.high_refresh_cost ? `手动刷新 · ${row.refresh_cost_label || "-"}` : row.coverage_note || `${row.refresh_cost_label || "-"} · 阈值 ${row.stale_after_minutes || "-"}m`}</td>
                 <td>{Math.round((row.size_bytes || 0) / 1024)} KB</td>
                 <td>
                   <div className="table-actions">
@@ -2188,8 +3099,8 @@ export function DataView({
             <h4>缓存详情</h4>
             <p>{selectedDataRow ? `${selectedDataRow.inst_id} · ${selectedDataRow.bar} · ${selectedDataRow.count || selectedDataRow.candles} K线` : "选择一条 K 线缓存查看刷新原因、覆盖关系和诊断字段。"}</p>
           </div>
-          <span className={`snapshot-quality ${selectedDataRow?.recommended_refresh ? "is-warn" : selectedDataRow?.is_stale ? "is-info" : "is-good"}`}>
-            {selectedDataRow ? selectedDataRow.recommended_refresh ? "建议刷新" : selectedDataRow.is_stale ? "陈旧" : "新鲜" : "待选择"}
+          <span className={`snapshot-quality ${selectedDataRow?.recommended_refresh ? "is-warn" : selectedDataRow?.high_refresh_cost ? "is-info" : selectedDataRow?.is_stale ? "is-info" : "is-good"}`}>
+            {selectedDataRow ? selectedDataRow.recommended_refresh ? "建议刷新" : selectedDataRow.high_refresh_cost ? "手动长刷新" : selectedDataRow.is_stale ? "陈旧" : "新鲜" : "待选择"}
           </span>
         </div>
         {selectedDataRow ? (
@@ -2203,7 +3114,7 @@ export function DataView({
               <div>
                 <span>REFRESH COST</span>
                 <strong>{selectedDataRow.refresh_cost_label || `${selectedDataRow.refresh_estimated_requests || 1} 次请求`}</strong>
-                <p>优先级 {selectedDataRow.refresh_priority ?? 0}</p>
+                <p>优先级 {selectedDataRow.refresh_priority ?? 0} · 自动上限 {selectedDataRow.max_auto_refresh_estimated_requests ?? "-"}</p>
               </div>
               <div>
                 <span>COVERAGE</span>
@@ -2227,7 +3138,13 @@ export function DataView({
             </div>
           </>
         ) : (
-          <div className="task-detail-empty">当前没有符合筛选条件的 K 线缓存。</div>
+          <>
+            <div className="task-detail-empty">当前没有符合筛选条件的 K 线缓存。</div>
+            <div className="ledger-json-panel">
+              <span>Cache Raw JSON</span>
+              <pre>{JSON.stringify({ selected: null, filter: dataFilter }, null, 2)}</pre>
+            </div>
+          </>
         )}
       </div>
     </ViewShell>
@@ -2239,6 +3156,9 @@ export function LiveView({
   executionConfig,
   executionEnvironment,
   executionOrders,
+  ai4tradeStatus,
+  automationStatus,
+  readinessSnapshots,
   okxAccount,
   okxDiagnostics,
   okxPositions,
@@ -2247,6 +3167,7 @@ export function LiveView({
   executionConfigLoading,
   executionEnvironmentLoading,
   executionOrdersLoading,
+  ai4tradeLoading,
   okxLoading,
   okxDiagnosticsLoading,
   okxCredentialsLoading,
@@ -2261,14 +3182,17 @@ export function LiveView({
   onRefreshExecutionConfig,
   onRefreshExecutionEnvironment,
   onRefreshExecutionOrders,
+  onRefreshAi4TradeStatus,
   onRefreshOkxReadonly,
   onRunOkxDiagnostics,
   onSaveOkxSessionCredentials,
   onRunLivePreflight,
   onRunLiveSubmitLockTest,
+  onRecordExecutionAction,
 }) {
-  const [credentialForm, setCredentialForm] = useState({ api_key: "", api_secret: "", api_passphrase: "", simulated: false });
+  const [credentialForm, setCredentialForm] = useState({ api_key: "", api_secret: "", api_passphrase: "", simulated: false, persist_to_keychain: true });
   const [credentialStatus, setCredentialStatus] = useState("");
+  const [credentialSaveResult, setCredentialSaveResult] = useState(null);
   const [submitConfirmation, setSubmitConfirmation] = useState("");
   const [selectedLedgerKey, setSelectedLedgerKey] = useState("");
   const intent = executionPlan?.order_intent;
@@ -2278,17 +3202,62 @@ export function LiveView({
   const finalChecks = finalGate.checks || [];
   const recentExecution = (paperAudit?.rows || []).find((row) => ["execution_dry_run", "live_submit_rejected"].includes(row.action));
   const okxKeys = executionConfig?.okx_keys || {};
+  const okxKeychain = executionConfig?.okx_keychain || {};
+  const connectorHealth = okxDiagnostics?.connector_health || executionEnvironment?.connector_health || liveSubmitResult?.connector_attempt?.connector_health || {};
+  const connectorStatus = connectorHealth?.connector || executionConfig?.connector_status || liveSubmitResult?.connector_attempt?.connector || {};
+  const connectorAttempt = liveSubmitResult?.connector_attempt || {};
   const orderRows = executionOrders?.rows || [];
+  const ai4tradePolicy = ai4tradeStatus?.policy || {};
+  const ai4tradeHeartbeat = ai4tradeStatus?.heartbeat || {};
+  const ai4tradeSignals = ai4tradeStatus?.signals?.rows || [];
+  const ai4tradeSignalSummary = ai4tradeStatus?.signals?.summary || {};
+  const ai4tradeIntel = ai4tradeStatus?.market_intel || {};
+  const ai4tradeNewsCategories = ai4tradeIntel?.news?.categories || [];
+  const ai4tradeHistory = ai4tradeStatus?.history?.rows || [];
+  const ai4tradeHistoryLatest = ai4tradeHistory[0] || {};
+  const ai4tradeAlignment = automationStatus?.ai4trade_alignment || {};
+  const automationHeartbeatHistory = automationStatus?.heartbeat_history?.rows || [];
+  const automationHeartbeatLatest = automationHeartbeatHistory[0] || {};
+  const automationPreflightHistory = automationStatus?.preflight_history?.rows || [];
+  const automationPreflightLatest = automationPreflightHistory[0] || {};
+  const automationPreflightLatestMeta = automationPreflightStateMeta(automationPreflightLatest);
+  const automationPreflightShadowLatest = shadowOrderMeta(automationPreflightLatest.summary?.shadow_order);
+  const automationEventHistory = automationStatus?.event_history?.rows || [];
+  const automationEventLatest = automationEventHistory[0] || {};
+  const automationEventShadowLatest = shadowOrderMeta(automationEventLatest.preflight?.shadow_order);
+  const automationTaskBoard = automationStatus?.task_board || {};
+  const automationTaskRows = automationTaskBoard.tasks || [];
+  const automationTopTask = automationTaskBoard.top_task || automationTaskRows[0] || {};
+  const automationTaskActionHistory = automationTaskBoard.action_history?.rows || [];
+  const automationReadinessSummary = automationStatus?.readiness_summary || {};
+  const automationReadinessChecks = automationReadinessSummary.checks || {};
+  const automationReadinessLocks = automationReadinessSummary.locks || {};
+  const automationReadinessTone = readinessSummaryTone(automationReadinessSummary);
+  const automationReadinessPassed = Object.values(automationReadinessChecks).filter(Boolean).length;
+  const automationReadinessTotal = Object.keys(automationReadinessChecks).length;
+  const automationReadinessShadow = shadowOrderMeta(automationReadinessSummary.latest_shadow_order || automationPreflightLatest.summary?.shadow_order);
+  const preLiveGates = automationStatus?.pre_live_gates || {};
+  const preLiveGateRows = preLiveGates.phases || [];
+  const preLiveNextGate = preLiveGates.next_phase || preLiveGateRows.find((row) => row.status !== "go") || preLiveGateRows[0] || {};
+  const preLiveNextMeta = preLiveGateMeta(preLiveNextGate);
+  const readinessSnapshotRows = readinessSnapshots?.rows || [];
+  const readinessSnapshotLatest = readinessSnapshots?.latest || readinessSnapshotRows[0] || {};
+  const readinessSnapshotLocks = readinessSnapshotLatest.locks || {};
+  const readinessSnapshotChecks = readinessSnapshotLatest.checks || {};
+  const readinessSnapshotLocked = Boolean(readinessSnapshotLocks.dry_run_only) && !readinessSnapshotLocks.can_submit_live;
   const okxRows = okxPositions?.positions || [];
   const envOkx = executionEnvironment?.okx_account || okxAccount || {};
   const envPositions = executionEnvironment?.okx_positions || okxPositions || {};
   const okxEquityNumber = Number(envOkx.total_equity_usd);
   const diagnosticSteps = okxDiagnostics?.steps || [];
   const diagnosticActions = okxDiagnostics?.actions || [];
+  const okxDiagnosticHistory = okxDiagnostics?.history?.rows || [];
   const instrumentRules = executionPlan?.exchange_rules?.instrument || {};
   const exchangeValidation = executionPlan?.exchange_rules?.validation || {};
   const okxOrderPreview = executionPlan?.okx_order || {};
   const okxOrderPayload = okxOrderPreview?.payload || {};
+  const canaryOrderPreview = executionPlan?.canary_order || {};
+  const canaryOrderPayload = canaryOrderPreview?.okx_order?.payload || {};
   const dataQuality = executionPlan?.data_quality || {};
   const preflight = preflightSummary(executionPlan, okxDiagnostics, executionConfig);
   const submitPath = liveSubmitPath(executionPlan, executionConfig, okxDiagnostics, executionEnvironment);
@@ -2297,14 +3266,24 @@ export function LiveView({
   const liveSubmitChecks = liveSubmitResult?.checks || [];
   const liveSubmitBlocked = liveSubmitResult?.blocked_reasons || [];
   const recentLiveReject = orderRows.find((row) => row.event === "live_submit_rejected");
+  const pendingLifecycleRows = orderRows.filter((row) => ["ack_timeout", "cancel_due", "pending_ack", "open"].includes(row.lifecycle?.phase));
+  const blockedLifecycleRows = orderRows.filter((row) => ["ack_timeout", "cancel_due"].includes(row.lifecycle?.phase));
   const ledgerRows = orderRows.slice(0, 10);
   const selectedLedgerRow = ledgerRows.find((row, index) => ledgerRowKey(row, index) === selectedLedgerKey) || ledgerRows[0] || null;
+  const selectedLedgerLifecycle = selectedLedgerRow?.lifecycle || {};
+  const selectedLedgerLifecycleChecks = selectedLedgerLifecycle.checks || [];
   const selectedLedgerFinalGate = selectedLedgerRow?.final_gate || {};
   const selectedLedgerChecks = selectedLedgerFinalGate?.checks || [];
   const selectedLedgerOrder = selectedLedgerRow?.okx_order || {};
   const selectedLedgerPayload = selectedLedgerOrder?.payload || {};
+  const selectedLedgerAdapterPreview = selectedLedgerRow?.adapter_preview || {};
   const selectedLedgerValidation = selectedLedgerRow?.exchange_validation || {};
+  const selectedLedgerShadow = selectedLedgerRow?.shadow_order || {};
+  const selectedLedgerShadowGate = selectedLedgerShadow?.final_gate || {};
+  const selectedLedgerShadowConnector = selectedLedgerShadow?.connector || {};
   const selectedLedgerReasons = selectedLedgerRow?.rejection_reasons || selectedLedgerFinalGate?.blocked_reasons || [];
+  const canQuerySelectedOrder = Boolean(selectedLedgerRow && connectorStatus.configured);
+  const canCancelSelectedOrder = Boolean(selectedLedgerRow && connectorStatus.can_cancel_live);
   const liveActionRows = [
     {
       key: "environment",
@@ -2363,15 +3342,17 @@ export function LiveView({
     {
       key: "ledger",
       title: "刷新执行账本",
-      detail: `${orderRows.length} 条 dry-run / 拒绝记录，用于识别重复订单意图。`,
+      detail: `${orderRows.length} 条记录 · ${pendingLifecycleRows.length} 条需跟踪 · ${blockedLifecycleRows.length} 条超时/待撤。`,
       action: executionOrdersLoading ? "刷新中..." : "刷新账本",
       disabled: executionOrdersLoading,
-      status: orderRows.length ? "pass" : "pending",
+      status: blockedLifecycleRows.length ? "fail" : pendingLifecycleRows.length ? "warn" : orderRows.length ? "pass" : "pending",
       onClick: onRefreshExecutionOrders,
     },
   ];
   const minLiveEquity = Number(liveRiskConfig?.min_live_equity_usd ?? 10);
   const marginBufferMult = Number(liveRiskConfig?.live_margin_buffer_mult ?? 1.2);
+  const maxLiveOrderNotional = Number(liveRiskConfig?.max_live_order_notional_usd ?? 10);
+  const canaryOrderNotional = Number(liveRiskConfig?.canary_order_notional_usd ?? 10);
   const updateLiveRiskNumber = (key, value) => {
     const number = Number(value);
     if (!Number.isFinite(number)) return;
@@ -2379,13 +3360,32 @@ export function LiveView({
   };
   const updateCredentialField = (key, value) => {
     setCredentialStatus("");
+    setCredentialSaveResult(null);
     setCredentialForm((current) => ({ ...current, [key]: value }));
   };
+  const keychainMissingLabels = (keys = {}) => Object.entries(keys)
+    .filter(([, ok]) => !ok)
+    .map(([key]) => key.replace("OKX_", ""));
   const submitCredentials = async (event) => {
     event.preventDefault();
-    await onSaveOkxSessionCredentials?.(credentialForm);
-    setCredentialForm({ api_key: "", api_secret: "", api_passphrase: "", simulated: credentialForm.simulated });
-    setCredentialStatus("已保存到当前后端进程，输入框已清空。");
+    const result = await onSaveOkxSessionCredentials?.(credentialForm);
+    setCredentialForm({ api_key: "", api_secret: "", api_passphrase: "", simulated: credentialForm.simulated, persist_to_keychain: credentialForm.persist_to_keychain });
+    setCredentialSaveResult(result || null);
+    const keychainOk = Boolean(result?.keychain?.ok && result?.keychain?.verified && result?.keychain_status?.configured);
+    const keychainErrors = Object.keys(result?.keychain?.errors || {});
+    const verifiedKeys = result?.keychain?.verified_keys || result?.keychain_status?.keys || {};
+    const missingKeys = keychainMissingLabels(verifiedKeys);
+    if (keychainOk) {
+      setCredentialStatus(result?.next_action || "已保存到当前后端进程，并完成 macOS Keychain 读回校验；后端重启后会自动恢复。");
+    } else if (result?.keychain?.skipped) {
+      setCredentialStatus(result?.next_action || "已保存到当前后端进程，但未写入 Keychain；后端重启后需要重新输入。");
+    } else if (keychainErrors.length) {
+      setCredentialStatus(result?.next_action || `当前进程已保存，但 Keychain 写入失败：${keychainErrors.map((key) => key.replace("OKX_", "")).join("、")}；建议使用终端 import-secrets。`);
+    } else if (missingKeys.length) {
+      setCredentialStatus(result?.next_action || `当前进程已保存，但 Keychain 读回校验缺失：${missingKeys.join("、")}；建议使用终端 import-secrets --restart。`);
+    } else {
+      setCredentialStatus(result?.next_action || "当前进程已保存，但 Keychain 状态未确认；请刷新环境或运行 secrets-status。");
+    }
   };
   return (
     <ViewShell title="实盘" subtitle="真实下单前的订单意图、执行保护和 dry-run 审计。">
@@ -2394,6 +3394,201 @@ export function LiveView({
         <StatCell label="执行结论" value={guard.decision || "-"} note={guard.allow_live ? "允许真实执行" : guard.allow_dry_run ? "仅允许 dry-run" : "阻断执行"} tone={guard.allow_live ? "text-risk" : guard.allow_dry_run ? "text-aqua" : "text-risk"} />
         <StatCell label="最终提交" value={finalGate.decision || "-"} note={finalGate.allow_submit ? "全部通过" : finalGate.blocked_reasons?.[0] || "等待预演"} tone={finalGate.allow_submit ? "text-aqua" : finalGate.ready_except_live_lock ? "text-sky-300" : "text-risk"} />
         <StatCell label="模拟盘状态" value={paperState?.running ? "运行中" : "已停止"} note={`权益 ${money(paperState?.equity)}U · 日内 ${paperState?.day_trades ?? 0} 笔`} />
+        <StatCell label="只读就绪" value={automationReadinessSummary.readonly_ready ? "已就绪" : "未就绪"} note={automationReadinessChecks.okx_readonly_ok ? "OKX只读通过" : automationReadinessSummary.blockers?.[0] || "等待只读诊断"} tone={automationReadinessSummary.readonly_ready ? "text-aqua" : "text-risk"} />
+        <StatCell label="Canary复核" value={automationReadinessSummary.canary_review_ready ? "可复核" : "未就绪"} note={automationReadinessSummary.next_action || "等待 readiness summary"} tone={automationReadinessTone} />
+        <StatCell label="证据检查" value={automationReadinessTotal ? `${automationReadinessPassed}/${automationReadinessTotal}` : "-"} note={`shadow ${automationReadinessShadow.label} · no submitted ${automationReadinessChecks.no_real_submitted_orders ? "OK" : "检查"}`} tone={automationReadinessPassed === automationReadinessTotal && automationReadinessTotal ? "text-aqua" : "text-sky-300"} />
+        <StatCell label="Readiness状态" value={automationReadinessSummary.status || "-"} note={`dry_run_only=${automationReadinessLocks.dry_run_only ?? executionConfig?.dry_run_only} · can_submit_live=${automationReadinessLocks.can_submit_live ?? executionConfig?.can_submit_live}`} tone={automationReadinessTone} />
+      </div>
+
+      <div className="mt-5 analysis-card">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <p className="text-xs uppercase tracking-[0.28em] text-slate-500">Pre-live Gate</p>
+            <h3 className="text-lg font-semibold text-white">实盘前闸门</h3>
+            <p className="mt-1 text-sm text-slate-400">资金到位后仍按只读验证、Canary复核、真实提交三阶段推进；真实提交阶段当前强制人工解锁。</p>
+          </div>
+          <span className={`candidate-health ${preLiveNextMeta.badge}`}>
+            {preLiveNextGate.label || "等待闸门"} · {preLiveNextMeta.label}
+          </span>
+        </div>
+        <div className="mt-4 risk-grid">
+          <StatCell label="当前阻塞" value={preLiveNextGate.label || "-"} note={preLiveGateCheckSummary(preLiveNextGate)} tone={preLiveNextMeta.tone} />
+          <StatCell label="GO阶段" value={`${preLiveGates.go_count ?? 0}/${preLiveGates.count ?? preLiveGateRows.length ?? 0}`} note={`权益源 ${preLiveGates.equity_source_label || preLiveGates.equity_source || "-"}`} tone={(preLiveGates.go_count ?? 0) > 0 ? "text-aqua" : "text-risk"} />
+          <StatCell label="曲线锚点" value={preLiveGates.anchor_date || "2026-06-06"} note={`${Math.round(Number(preLiveGates.interval_seconds || 900) / 60)}分钟刷新 · 起点固定`} tone="text-sky-300" />
+          <StatCell label="实盘提交" value={automationReadinessLocks.can_submit_live ? "异常开启" : "锁定"} note={`dry_run_only=${automationReadinessLocks.dry_run_only ?? "-"} · can_submit_live=${automationReadinessLocks.can_submit_live ?? "-"}`} tone={automationReadinessLocks.can_submit_live ? "text-risk" : "text-aqua"} />
+        </div>
+        <div className="mt-4 overflow-x-auto rounded-[18px] border border-white/10">
+          <table className="trade-table">
+            <thead><tr><th>阶段</th><th>状态</th><th>阻塞/下一步</th><th>检查</th><th>锁</th></tr></thead>
+            <tbody>
+              {preLiveGateRows.length ? preLiveGateRows.map((gate) => {
+                const meta = preLiveGateMeta(gate);
+                const failedChecks = (gate.checks || []).filter((row) => !row.ok);
+                const issueLabels = preLiveGateIssueLabels(gate);
+                return (
+                  <tr key={gate.phase}>
+                    <td>{gate.label || gate.phase}</td>
+                    <td><span className={`candidate-health ${meta.badge}`}>{meta.label}</span></td>
+                    <td className="max-w-[520px]">
+                      <p className="text-sm text-slate-200">{preLiveGateCheckSummary(gate)}</p>
+                      {issueLabels.length ? (
+                        <div className="mt-2 flex flex-wrap gap-1.5">
+                          {issueLabels.map((label) => (
+                            <span key={`${gate.phase}-${label}`} className="candidate-health is-risk">{label}</span>
+                          ))}
+                        </div>
+                      ) : null}
+                    </td>
+                    <td>{(gate.checks || []).filter((row) => row.ok).length}/{(gate.checks || []).length} · {failedChecks[0]?.label || failedChecks[0]?.name || "通过"}</td>
+                    <td>dry={String(gate.locks?.dry_run_only ?? "-")} · live={String(gate.locks?.can_submit_live ?? "-")}</td>
+                  </tr>
+                );
+              }) : (
+                <tr><td colSpan="5">等待后端返回 pre_live_gates。刷新自动化状态后会显示三阶段闸门。</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="mt-5 analysis-card">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <p className="text-xs uppercase tracking-[0.28em] text-slate-500">Readiness Evidence</p>
+            <h3 className="text-lg font-semibold text-white">Readiness快照历史</h3>
+            <p className="mt-1 text-sm text-slate-400">记录 Keychain 导入、自检、只读验证和 Canary 复核阶段变化；快照只保存脱敏状态和实盘锁证据。</p>
+          </div>
+          <span className={`status-pill ${readinessSnapshotLocked ? "is-good" : "is-warn"}`}>
+            {readinessSnapshotRows.length ? readinessSnapshotLocked ? "快照锁定" : "快照待检查" : "等待快照"}
+          </span>
+        </div>
+        <div className="mt-4 risk-grid">
+          <StatCell label="快照数量" value={`${readinessSnapshots?.count ?? readinessSnapshotRows.length ?? 0}`} note={readinessSnapshots?.path || "等待 readiness --record"} tone={readinessSnapshotRows.length ? "text-aqua" : "text-sky-300"} />
+          <StatCell label="最新快照" value={readinessSnapshotLatest.status || "-"} note={readinessSnapshotLatest.time ? `${shortTime(readinessSnapshotLatest.time)} · ${readinessSnapshotLatest.source || "-"}` : "尚未记录"} tone={readinessSummaryTone(readinessSnapshotLatest)} />
+          <StatCell label="只读/Canary" value={`${readinessSnapshotLatest.readonly_ready ? "只读OK" : "只读待定"} / ${readinessSnapshotLatest.canary_review_ready ? "Canary可复核" : "Canary未就绪"}`} note={`keychain=${readinessSnapshotChecks.keychain_ok ?? "-"} · okx=${readinessSnapshotChecks.okx_readonly_ok ?? "-"}`} tone={readinessSnapshotLatest.canary_review_ready ? "text-aqua" : readinessSnapshotLatest.readonly_ready ? "text-sky-300" : "text-risk"} />
+          <StatCell label="快照实盘锁" value={readinessSnapshotLocked ? "锁定" : "检查"} note={`dry_run_only=${readinessSnapshotLocks.dry_run_only ?? "-"} · can_submit_live=${readinessSnapshotLocks.can_submit_live ?? "-"}`} tone={readinessSnapshotLocked ? "text-aqua" : "text-risk"} />
+        </div>
+        <div className="mt-4 overflow-x-auto rounded-[18px] border border-white/10">
+          <table className="trade-table">
+            <thead><tr><th>时间</th><th>来源</th><th>状态</th><th>只读</th><th>实盘锁</th><th>下一步</th></tr></thead>
+            <tbody>
+              {readinessSnapshotRows.length ? readinessSnapshotRows.slice(0, 8).map((row, index) => {
+                const locks = row.locks || {};
+                const checks = row.checks || {};
+                const locked = Boolean(locks.dry_run_only) && !locks.can_submit_live;
+                return (
+                  <tr key={`${row.time || index}-${row.status || index}`}>
+                    <td>{shortTime(row.time)}</td>
+                    <td>{row.source || "-"}</td>
+                    <td>{row.status || "-"}</td>
+                    <td>{row.readonly_ready ? "通过" : "未就绪"} · keychain={String(checks.keychain_ok ?? "-")}</td>
+                    <td>{locked ? "锁定" : "检查"} · dry={String(locks.dry_run_only ?? "-")} live={String(locks.can_submit_live ?? "-")}</td>
+                    <td className="max-w-[360px] truncate">{row.next_action || row.top_task?.command || "-"}</td>
+                  </tr>
+                );
+              }) : (
+                <tr><td colSpan="6">等待 `python3 scripts/manage_24x7.py readiness --record` 或导入后自动快照。</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="mt-5 analysis-card">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <p className="text-xs uppercase tracking-[0.28em] text-slate-500">External Signal Hub</p>
+            <h3 className="text-lg font-semibold text-white">AI4Trade 只读信号源</h3>
+            <p className="mt-1 text-sm text-slate-400">只拉取 agent、signals/feed、heartbeat 和 market-intel；跟单、发布和挑战交易全部被本地策略锁定。</p>
+          </div>
+          <button type="button" className="table-action" onClick={() => onRefreshAi4TradeStatus?.()} disabled={ai4tradeLoading}>
+            {ai4tradeLoading ? "读取中..." : "刷新AI4Trade"}
+          </button>
+        </div>
+        <div className="mt-4 risk-grid">
+          <StatCell label="连接状态" value={ai4tradeStatus?.configured ? "已配置" : "未配置"} note={ai4tradeStatus?.credentials?.agent_name || ai4tradeStatus?.credentials?.env_file || "等待本地 token"} tone={ai4tradeStatus?.configured ? "text-aqua" : "text-risk"} />
+          <StatCell label="只读策略" value={ai4tradePolicy.trade_endpoints_locked ? "交易锁定" : "需检查"} note={ai4tradePolicy.okx_bridge || "不会桥接 OKX 下单"} tone={ai4tradePolicy.trade_endpoints_locked ? "text-aqua" : "text-risk"} />
+          <StatCell label="对齐自检" value={ai4tradeAlignment.ok ? "通过" : "待处理"} note={ai4tradeAlignment.detail || "等待 automation/AI4Trade 对齐证据"} tone={ai4tradeAlignment.ok ? "text-aqua" : "text-risk"} />
+          <StatCell label="Signals" value={`${ai4tradeSignalSummary.count ?? 0} 条`} note={(ai4tradeSignalSummary.symbols || []).slice(0, 3).map(([symbol, count]) => `${symbol}:${count}`).join(" · ") || "等待 signals/feed"} tone={ai4tradeStatus?.signals?.ok ? "text-aqua" : "text-sky-300"} />
+          <StatCell label="Heartbeat" value={ai4tradeHeartbeat.ok ? "正常" : "不可用"} note={`${ai4tradeHeartbeat.message_count ?? 0} 消息 · ${ai4tradeHeartbeat.task_count ?? 0} 任务`} tone={ai4tradeHeartbeat.ok ? "text-aqua" : "text-risk"} />
+          <StatCell label="Market Intel" value={ai4tradeIntel.overview_ok || ai4tradeIntel.news_ok ? "可读" : "不可用"} note={ai4tradeIntel.overview?.latest_headline || ai4tradeIntel.error || "等待 market-intel"} tone={ai4tradeIntel.overview_ok || ai4tradeIntel.news_ok ? "text-aqua" : "text-sky-300"} />
+          <StatCell label="AI4Trade历史" value={`${ai4tradeStatus?.history?.count ?? ai4tradeHistory.length}`} note={ai4tradeHistoryLatest.time ? `${shortTime(ai4tradeHistoryLatest.time)} · ${(ai4tradeHistoryLatest.signals?.summary?.count ?? 0)} signals` : "等待 sidecar 快照"} tone={ai4tradeHistoryLatest.ok ? "text-aqua" : "text-sky-300"} />
+          <StatCell label="OKX联动" value="禁用" note="只进入人工评估和 dry-run 注释" tone="text-aqua" />
+        </div>
+        <div className="mt-4 overflow-x-auto rounded-[18px] border border-white/10">
+          <table className="trade-table">
+            <thead><tr><th>AI4Trade历史</th><th>Agent</th><th>Heartbeat</th><th>Signals</th><th>Market Intel</th><th>策略</th></tr></thead>
+            <tbody>
+              {ai4tradeHistory.length ? ai4tradeHistory.slice(0, 8).map((row, index) => (
+                <tr key={`${row.time || index}-${row.agent?.id || index}`}>
+                  <td>{shortTime(row.time)}</td>
+                  <td>{row.agent?.name || row.agent?.id || "-"}</td>
+                  <td>{row.heartbeat?.ok ? "正常" : row.heartbeat?.category || "不可用"} · {row.heartbeat?.message_count ?? 0}/{row.heartbeat?.task_count ?? 0}</td>
+                  <td>{row.signals?.summary?.count ?? 0} 条</td>
+                  <td>{row.market_intel?.overview_ok || row.market_intel?.news_ok ? "可读" : row.market_intel?.category || "不可用"}</td>
+                  <td>{row.policy?.trade_endpoints_locked ? "交易锁定" : "需检查"}</td>
+                </tr>
+              )) : (
+                <tr><td colSpan="6">暂无 AI4Trade 历史。刷新 AI4Trade 后会记录 heartbeat、signals 和 market-intel 摘要。</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        <div className="mt-4 grid gap-4 xl:grid-cols-[1.15fr_.85fr]">
+          <div className="overflow-x-auto rounded-[18px] border border-white/10">
+            <table className="trade-table">
+              <thead><tr><th>信号</th><th>来源</th><th>标的</th><th>类型</th><th>时间</th></tr></thead>
+              <tbody>
+                {ai4tradeSignals.length ? ai4tradeSignals.slice(0, 8).map((row, index) => (
+                  <tr key={`${row.id || row.signal_id || index}-${row.timestamp || row.created_at || index}`}>
+                    <td>{String(row.title || row.content || row.action || "-").slice(0, 90)}</td>
+                    <td>{row.agent_name || row.author_name || row.agent_id || "-"}</td>
+                    <td>{row.symbol || row.market || "-"}</td>
+                    <td>{row.message_type || row.type || row.side || "-"}</td>
+                    <td>{shortTime(row.created_at || row.executed_at || row.timestamp)}</td>
+                  </tr>
+                )) : (
+                  <tr><td colSpan="5">{ai4tradeLoading ? "正在读取 AI4Trade signals/feed..." : ai4tradeStatus?.signals?.error || "暂无 AI4Trade 信号。"}</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+          <div className="event-list">
+            {ai4tradeNewsCategories.length ? ai4tradeNewsCategories.slice(0, 4).map((section) => (
+              <div className="event-row" key={section.category || section.label || section.created_at}>
+                <span className={`preflight-dot is-${section.available === false ? "warn" : "pass"}`} />
+                <div>
+                  <strong>{section.label_zh || section.label || section.category || "Market Intel"}</strong>
+                  <p>{section.summary?.top_headline || section.summary?.activity_level || section.items?.[0]?.title || "无最新摘要"}</p>
+                </div>
+              </div>
+            )) : (
+              <div className="event-row">
+                <span className="preflight-dot is-pending" />
+                <div>
+                  <strong>Market Intel</strong>
+                  <p>{ai4tradeLoading ? "正在读取 market-intel..." : ai4tradeIntel.error || "暂无 market-intel 新闻快照。"}</p>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+        <div className="mt-4 ledger-json-panel">
+          <span>AI4Trade Read-only JSON</span>
+          <pre>{JSON.stringify({
+            configured: ai4tradeStatus?.configured,
+            agent: ai4tradeStatus?.credentials?.agent_name,
+            policy: ai4tradePolicy,
+            heartbeat: ai4tradeHeartbeat,
+            signal_summary: ai4tradeSignalSummary,
+            market_intel: {
+              overview_ok: ai4tradeIntel.overview_ok,
+              news_ok: ai4tradeIntel.news_ok,
+              category: ai4tradeIntel.category,
+              latest_headline: ai4tradeIntel.overview?.latest_headline,
+            },
+          }, null, 2)}</pre>
+        </div>
       </div>
 
       <div className="mt-5 analysis-card">
@@ -2426,6 +3621,131 @@ export function LiveView({
       <div className="mt-5 analysis-card">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
           <div>
+            <p className="text-xs uppercase tracking-[0.28em] text-slate-500">Automation Heartbeat</p>
+            <h3 className="text-lg font-semibold text-white">自动化自检历史</h3>
+            <p className="mt-1 text-sm text-slate-400">每次 ready 信号或手动自检都会写入 dry-run 摘要；真实提交保持锁定。</p>
+          </div>
+          <span className={`candidate-health ${automationPreflightLatestMeta.tone === "pass" ? "is-ok" : automationPreflightLatestMeta.tone === "fail" ? "is-risk" : "is-info"}`}>
+            {automationPreflightLatest.time ? `${automationPreflightLatestMeta.label} · ${shortTime(automationPreflightLatest.time)}` : "等待自检"}
+          </span>
+        </div>
+        <div className="mt-4 risk-grid">
+          <StatCell label="自检历史" value={`${automationStatus?.preflight_history?.count ?? automationPreflightHistory.length}`} note="最近记录 newest-first" />
+          <StatCell label="最新来源" value={automationPreflightLatest.source || "-"} note={automationPreflightLatest.signal?.inst_id || "等待 ready 信号"} />
+          <StatCell label="最新决策" value={automationPreflightLatest.summary?.guard_decision || automationPreflightLatest.error || "-"} note={automationPreflightLatest.summary?.final_gate_status || automationPreflightLatest.state || "-"} tone={automationPreflightLatestMeta.tone === "pass" ? "text-aqua" : automationPreflightLatestMeta.tone === "fail" ? "text-risk" : "text-sky-300"} />
+          <StatCell label="实盘锁" value={automationPreflightLatest.can_submit_live ? "异常开启" : "锁定"} note={automationPreflightLatest.dry_run_only ? "dry_run_only=true" : "等待记录"} tone={automationPreflightLatest.can_submit_live ? "text-risk" : "text-aqua"} />
+          <StatCell label="影子单" value={automationPreflightShadowLatest.label} note={automationPreflightShadowLatest.detail} tone={automationPreflightShadowLatest.tone} />
+          <StatCell label="心跳历史" value={`${automationStatus?.heartbeat_history?.count ?? automationHeartbeatHistory.length}`} note={automationHeartbeatLatest.time ? `${shortTime(automationHeartbeatLatest.time)} · ${automationHeartbeatLatest.state || "-"}` : "等待 paper loop"} tone={automationStatus?.heartbeat_fresh ? "text-aqua" : "text-risk"} />
+          <StatCell label="阶段事件" value={`${automationStatus?.event_history?.count ?? automationEventHistory.length}`} note={automationEventLatest.time ? `${automationEventShadowLatest.label} · ${shortTime(automationEventLatest.time)}` : "等待阶段变化"} tone={automationEventLatest.can_submit_live ? "text-risk" : automationEventShadowLatest.tone} />
+          <StatCell label="任务板" value={`${automationTaskBoard.count ?? automationTaskRows.length}`} note={automationTopTask.title || "等待自动化任务"} tone={automationTaskBoard.critical_count ? "text-risk" : automationTaskBoard.blocked_count ? "text-sky-300" : "text-aqua"} />
+        </div>
+        <div className="mt-4 overflow-x-auto rounded-[18px] border border-white/10">
+          <table className="trade-table">
+            <thead><tr><th>自动化任务</th><th>状态</th><th>说明</th><th>动作</th><th>实盘</th></tr></thead>
+            <tbody>
+              {automationTaskRows.length ? automationTaskRows.slice(0, 8).map((row, index) => (
+                <tr key={`${row.id || index}-${row.status || index}`}>
+                  <td>{row.title || row.id || "-"}</td>
+                  <td><span className={`candidate-health ${row.status === "critical" ? "is-risk" : row.status === "blocked" ? "is-info" : row.status === "ready" || row.status === "review" ? "is-ok" : "is-info"}`}>{row.status || "-"}</span></td>
+                  <td>{row.detail || "-"}</td>
+                  <td>{row.command || row.action || "-"}</td>
+                  <td>{row.can_submit_live ? "异常开启" : row.dry_run_only ? "dry-run锁定" : "等待记录"}</td>
+                </tr>
+              )) : (
+                <tr><td colSpan="5">暂无自动化任务。automation status 下一次刷新后会根据阶段生成任务板。</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        <div className="mt-4 overflow-x-auto rounded-[18px] border border-white/10">
+          <table className="trade-table">
+            <thead><tr><th>任务回执</th><th>动作</th><th>来源</th><th>备注</th><th>实盘</th></tr></thead>
+            <tbody>
+              {automationTaskActionHistory.length ? automationTaskActionHistory.slice(0, 6).map((row, index) => (
+                <tr key={`${row.time || index}-${row.task_id || index}-${row.action || index}`}>
+                  <td>{shortTime(row.time)} · {row.task_id || "-"}</td>
+                  <td>{row.status || row.action || "-"}</td>
+                  <td>{row.source || "-"}</td>
+                  <td>{row.note || "-"}</td>
+                  <td>{row.can_submit_live ? "异常开启" : row.dry_run_only ? "dry-run锁定" : "等待记录"}</td>
+                </tr>
+              )) : (
+                <tr><td colSpan="5">暂无任务回执。CLI 或页面记录任务动作后会在这里显示。</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        <div className="mt-4 overflow-x-auto rounded-[18px] border border-white/10">
+          <table className="trade-table">
+            <thead><tr><th>阶段事件</th><th>状态</th><th>信号</th><th>预检</th><th>影子单</th><th>下一步</th><th>实盘</th></tr></thead>
+            <tbody>
+              {automationEventHistory.length ? automationEventHistory.slice(0, 8).map((row, index) => {
+                const shadow = shadowOrderMeta(row.preflight?.shadow_order);
+                return (
+                  <tr key={`${row.time || index}-${row.stage || index}-${row.signal_hash || index}`}>
+                    <td>{shortTime(row.time)}</td>
+                    <td>{row.label || row.stage || "-"} · {row.automation_state || "-"}</td>
+                    <td>{row.signal?.inst_id || "-"} · {row.signal?.status || "-"} · {row.signal?.side || "-"}</td>
+                    <td>{row.preflight?.guard_decision || row.preflight?.final_gate_status || "-"}</td>
+                    <td><span className={`snapshot-quality ${shadow.badge}`}>{shadow.label}</span></td>
+                    <td>{row.next_action || row.blockers?.[0] || "-"}</td>
+                    <td>{row.can_submit_live ? "异常开启" : row.dry_run_only ? "dry-run锁定" : "等待记录"}</td>
+                  </tr>
+                );
+              }) : (
+                <tr><td colSpan="7">暂无阶段事件。automation status 首次计算或阶段变化后会自动写入。</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        <div className="mt-4 overflow-x-auto rounded-[18px] border border-white/10">
+          <table className="trade-table">
+            <thead><tr><th>自动化心跳历史</th><th>来源</th><th>状态</th><th>标的</th><th>权益</th><th>实盘</th></tr></thead>
+            <tbody>
+              {automationHeartbeatHistory.length ? automationHeartbeatHistory.slice(0, 8).map((row, index) => (
+                <tr key={`${row.time || index}-${row.count || index}`}>
+                  <td>{shortTime(row.time)}</td>
+                  <td>{row.source || "-"}</td>
+                  <td>{row.state || "-"}</td>
+                  <td>{row.inst_id || "-"} · {row.signal_status || "-"}</td>
+                  <td>{money(row.equity)}U</td>
+                  <td>{row.can_submit_live ? "异常开启" : row.dry_run_only ? "dry-run锁定" : "等待记录"}</td>
+                </tr>
+              )) : (
+                <tr><td colSpan="6">暂无自动化心跳历史。paper loop 下一次心跳后会自动写入。</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        <div className="mt-4 overflow-x-auto rounded-[18px] border border-white/10">
+          <table className="trade-table">
+            <thead><tr><th>时间</th><th>来源</th><th>状态</th><th>信号</th><th>决策</th><th>影子单</th><th>实盘</th></tr></thead>
+            <tbody>
+              {automationPreflightHistory.length ? automationPreflightHistory.slice(0, 8).map((row, index) => {
+                const meta = automationPreflightStateMeta(row);
+                const shadow = shadowOrderMeta(row.summary?.shadow_order);
+                return (
+                  <tr key={`${row.time || index}-${row.signal_hash || index}`}>
+                    <td>{shortTime(row.time)}</td>
+                    <td>{row.source || "-"}</td>
+                    <td><span className={`candidate-health ${meta.tone === "pass" ? "is-ok" : meta.tone === "fail" ? "is-risk" : "is-info"}`}>{meta.label}</span></td>
+                    <td>{row.signal?.inst_id || "-"} · {row.signal?.side || row.signal?.status || "-"}</td>
+                    <td>{row.summary?.guard_decision || row.error || row.summary?.final_gate_status || "-"}</td>
+                    <td><span className={`snapshot-quality ${shadow.badge}`}>{shadow.label}</span></td>
+                    <td>{row.can_submit_live ? "异常开启" : row.dry_run_only ? "dry-run锁定" : "等待记录"}</td>
+                  </tr>
+                );
+              }) : (
+                <tr><td colSpan="7">暂无自动化自检历史。手动运行自检或等待 ready 信号后会自动写入。</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="mt-5 analysis-card">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
             <p className="text-xs uppercase tracking-[0.28em] text-slate-500">Preflight</p>
             <h3 className="text-lg font-semibold text-white">一键预演流程</h3>
             <p className="mt-1 text-sm text-slate-400">刷新 OKX、运行诊断、生成执行预演并更新最终门槛。</p>
@@ -2440,6 +3760,7 @@ export function LiveView({
           <StatCell label="行情新鲜度" value={dataQuality.status === "fresh" ? "新鲜" : executionPlan ? "陈旧" : "-"} note={dataQuality.latest_closed ? `${dataQuality.source || "-"} · ${dataQuality.latest_closed}` : "等待预演"} tone={dataQuality.ok ? "text-aqua" : "text-risk"} />
           <StatCell label="订单意图" value={intent ? "已生成" : "未生成"} note={intent?.side ? `${intent.side} ${money(intent.notional)}U` : executionPlan ? "等待 ready 信号" : "等待预演"} tone={intent ? "text-aqua" : "text-sky-300"} />
           <StatCell label="最终门槛" value={finalGate.decision || "-"} note={finalGate.blocked_reasons?.[0] || "等待预演"} tone={finalGate.allow_submit ? "text-aqua" : finalGate.ready_except_live_lock ? "text-sky-300" : "text-risk"} />
+          <StatCell label="单笔上限" value={`${money(finalGate.max_live_order_notional_usd ?? maxLiveOrderNotional)}U`} note={`当前订单 ${money(finalGate.order_notional)}U · canary ${money(finalGate.canary_order_notional_usd ?? canaryOrderNotional)}U`} tone={(Number(finalGate.order_notional || 0) <= Number(finalGate.max_live_order_notional_usd ?? maxLiveOrderNotional)) ? "text-aqua" : "text-risk"} />
         </div>
         <div className="mt-4 event-list">
           {(preflightSteps?.length ? preflightSteps : [
@@ -2501,6 +3822,11 @@ export function LiveView({
         </div>
         <div className="mt-4 task-detail-grid">
           <div>
+            <span>SUBMIT MODE</span>
+            <strong>{liveSubmitResult?.submit_mode === "canary" ? "Canary" : liveSubmitResult ? "Standard" : "等待测试"}</strong>
+            <p>{liveSubmitResult?.canary_order?.message || "Canary 锁测试会使用小额 payload。"}</p>
+          </div>
+          <div>
             <span>EXPECTED</span>
             <strong>{expectedConfirmation}</strong>
             <p>真实提交前必须显式输入的确认短语。</p>
@@ -2516,7 +3842,7 @@ export function LiveView({
             <p>{recentLiveReject?.rejection_reasons?.[0] || liveSubmitBlocked[0] || "暂无提交拒绝审计。"}</p>
           </div>
         </div>
-        <div className="mt-4 grid gap-3 xl:grid-cols-[1fr_auto_auto]">
+        <div className="mt-4 grid gap-3 xl:grid-cols-[1fr_auto_auto_auto]">
           <label className="param-input live-risk-input">
             <input
               autoComplete="off"
@@ -2531,6 +3857,9 @@ export function LiveView({
           </button>
           <button type="button" className="table-action" onClick={() => onRunLiveSubmitLockTest?.(submitConfirmation.trim())} disabled={liveSubmitLoading || !confirmationMatches}>
             {liveSubmitLoading ? "测试中..." : "确认短语锁测试"}
+          </button>
+          <button type="button" className="table-action" onClick={() => onRunLiveSubmitLockTest?.(submitConfirmation.trim(), { use_canary: true })} disabled={liveSubmitLoading || !confirmationMatches}>
+            {liveSubmitLoading ? "测试中..." : "Canary锁测试"}
           </button>
         </div>
         <div className="mt-4 grid gap-4 xl:grid-cols-[1fr_.9fr]">
@@ -2571,6 +3900,16 @@ export function LiveView({
             </div>
           </div>
         </div>
+        <div className="mt-4 ledger-json-panel">
+          <span>Connector Preview JSON</span>
+          <pre>{JSON.stringify({
+            submit_mode: liveSubmitResult?.submit_mode,
+            connector: connectorStatus,
+            connector_health: connectorHealth,
+            adapter: connectorAttempt,
+            canary_order: liveSubmitResult?.canary_order,
+          }, null, 2)}</pre>
+        </div>
       </div>
 
       <div className="mt-5 analysis-card">
@@ -2586,7 +3925,11 @@ export function LiveView({
         </div>
         <div className="mt-4 risk-grid">
           <StatCell label="OKX密钥" value={executionConfig?.okx_configured ? "齐全" : "缺失"} note={Object.entries(okxKeys).map(([key, ok]) => `${key.replace("OKX_", "")}:${ok ? "有" : "无"}`).join(" · ") || "-"} tone={executionConfig?.okx_configured ? "text-aqua" : "text-risk"} />
-          <StatCell label="连接器" value={executionConfig?.connector || "-"} note={executionConfig?.live_submit_available ? "可提交" : "真实提交未开放"} />
+          <StatCell label="Keychain" value={okxKeychain.configured ? "齐全" : "缺失"} note={`${okxKeychain.service || executionConfig?.okx_keychain_service || "okx-perp-bot"} · ${Object.entries(okxKeychain.keys || {}).map(([key, ok]) => `${key.replace("OKX_", "")}:${ok ? "有" : "无"}`).join(" · ") || "未检测"}`} tone={okxKeychain.configured ? "text-aqua" : "text-risk"} />
+          <StatCell label="连接器" value={executionConfig?.connector || "-"} note={executionConfig?.live_submit_available ? "双锁已开 · 可提交" : "默认锁定 · 待双环境锁"} />
+          <StatCell label="签名预览" value={connectorStatus.signature_ready ? "可生成" : "待密钥"} note={connectorStatus.dry_run_only ? "dry-run adapter / 待实盘双锁" : connectorStatus.blocked_reason || "-"} tone={connectorStatus.signature_ready ? "text-aqua" : "text-risk"} />
+          <StatCell label="私有自检" value={connectorHealth.status || "未运行"} note={connectorHealth.next_action || "运行 OKX 诊断后显示"} tone={connectorHealth.readonly_ok ? "text-aqua" : connectorHealth.configured ? "text-sky-300" : "text-risk"} />
+          <StatCell label="只读回执" value={connectorHealth.readonly_ok ? "通过" : okxDiagnostics ? "未通过" : "-"} note={`${connectorHealth.steps_checked?.length || 0} 个步骤 · score ${connectorHealth.score ?? "-"}`} tone={connectorHealth.readonly_ok ? "text-aqua" : "text-risk"} />
           <StatCell label="确认短语" value={executionConfig?.confirmation_phrase || "-"} note="真实提交还需二次确认" />
         </div>
         <form className="mt-4 grid gap-3 xl:grid-cols-[1fr_1fr_1fr_auto]" onSubmit={submitCredentials}>
@@ -2621,7 +3964,7 @@ export function LiveView({
             <em>Passphrase</em>
           </label>
           <button type="submit" className="table-action" disabled={okxCredentialsLoading}>
-            {okxCredentialsLoading ? "保存中..." : "保存密钥"}
+            {okxCredentialsLoading ? "保存中..." : credentialForm.persist_to_keychain ? "保存并写入Keychain" : "仅保存当前进程"}
           </button>
         </form>
         <label className="mt-3 flex items-center gap-2 text-sm text-slate-400">
@@ -2632,7 +3975,44 @@ export function LiveView({
           />
           使用 OKX 模拟盘标记
         </label>
-        <p className="mt-2 text-xs text-slate-500">{credentialStatus || "密钥只保存到当前后端进程，不写入仓库文件；后端重启后需要重新输入。"}</p>
+        <label className="mt-3 flex items-center gap-2 text-sm text-slate-400">
+          <input
+            type="checkbox"
+            checked={credentialForm.persist_to_keychain}
+            onChange={(event) => updateCredentialField("persist_to_keychain", event.target.checked)}
+          />
+          默认写入Keychain，供 7x24 守护进程重启后自动恢复
+        </label>
+        {!okxKeychain.configured && (
+          <div className="mt-3 rounded border border-amber-400/30 bg-amber-500/10 p-3 text-sm text-amber-100">
+            <strong>Keychain导入阻断</strong>
+            <p className="mt-1 text-amber-100/85">当前 LaunchAgent 重启后无法恢复 OKX 密钥；保存后必须看到三项 OKX Keychain 已读回确认。</p>
+            <p className="mt-2 font-mono text-xs text-amber-50">python3 scripts/manage_24x7.py import-secrets --restart</p>
+          </div>
+        )}
+        <p className="mt-2 text-xs text-slate-500">{credentialStatus || "密钥不会写入仓库文件；默认只存入当前后端进程和本机 macOS Keychain。取消勾选后端重启会丢失本次输入。"}</p>
+        <div className="mt-3 task-detail-meta">
+          <div>
+            <span>保存回执</span>
+            <p>{credentialSaveResult ? `${credentialSaveResult.scope || "-"} · keychain=${credentialSaveResult.keychain?.ok ? "ok" : "未写入"} · verified=${credentialSaveResult.keychain?.verified ? "ok" : "待处理"} · restart=${credentialSaveResult.restart_survives ? "可恢复" : "不可恢复"}` : "尚未在本次页面会话保存密钥。"}</p>
+          </div>
+          <div>
+            <span>Keychain写入校验</span>
+            <p>{credentialSaveResult ? (credentialSaveResult.keychain_status?.configured ? "三项 OKX Keychain 已读回确认。" : `缺失 ${keychainMissingLabels(credentialSaveResult.keychain_status?.keys || credentialSaveResult.keychain?.verified_keys || {}).join(" / ") || "未检测"}`) : "保存后自动读回 Keychain 状态。"}</p>
+          </div>
+          <div>
+            <span>Keychain恢复状态</span>
+            <p>{okxKeychain.configured ? "LaunchAgent 重启后可从 Keychain 恢复 OKX 密钥。" : "Keychain 仍缺少 OKX_API_KEY / SECRET / PASSPHRASE。"}</p>
+          </div>
+          <div>
+            <span>只读状态命令</span>
+            <p>python3 scripts/manage_24x7.py secrets-status</p>
+          </div>
+          <div>
+            <span>重启恢复命令</span>
+            <p>python3 scripts/manage_24x7.py import-secrets --restart</p>
+          </div>
+        </div>
       </div>
 
       <div className="mt-5 analysis-card">
@@ -2651,7 +4031,7 @@ export function LiveView({
           <StatCell label="保护权益" value={money(executionPlan?.guard?.equity ?? envOkx.total_equity_usd ?? paperState?.equity)} note={`模拟 ${money(paperState?.equity)}U · OKX ${money(envOkx.total_equity_usd)}U`} />
           <StatCell label="真实持仓" value={`${executionPlan?.guard?.okx_position_count ?? executionEnvironment?.position_count ?? envPositions.count ?? 0} 个`} note=">0 时阻断新开仓" tone={(executionPlan?.guard?.okx_position_count ?? executionEnvironment?.position_count ?? 0) > 0 ? "text-risk" : "text-aqua"} />
         </div>
-        <div className="mt-4 grid gap-3 xl:grid-cols-[1fr_1fr_auto_auto]">
+        <div className="mt-4 grid gap-3 xl:grid-cols-[1fr_1fr_1fr_1fr_auto_auto]">
           <label className="param-input live-risk-input">
             <input
               min="0"
@@ -2672,6 +4052,26 @@ export function LiveView({
             />
             <em>保证金缓冲倍数</em>
           </label>
+          <label className="param-input live-risk-input">
+            <input
+              min="0"
+              step="0.1"
+              type="number"
+              value={Number.isFinite(maxLiveOrderNotional) ? maxLiveOrderNotional : 10}
+              onChange={(event) => updateLiveRiskNumber("max_live_order_notional_usd", event.target.value)}
+            />
+            <em>单笔名义上限 USDT</em>
+          </label>
+          <label className="param-input live-risk-input">
+            <input
+              min="0"
+              step="0.1"
+              type="number"
+              value={Number.isFinite(canaryOrderNotional) ? canaryOrderNotional : 10}
+              onChange={(event) => updateLiveRiskNumber("canary_order_notional_usd", event.target.value)}
+            />
+            <em>Canary试运行 USDT</em>
+          </label>
           <button
             type="button"
             className="table-action"
@@ -2684,7 +4084,7 @@ export function LiveView({
             恢复10U
           </button>
         </div>
-        <p className="mt-2 text-xs text-slate-500">改动只影响 dry-run 的最终提交门槛，不会开启真实下单。</p>
+            <p className="mt-2 text-xs text-slate-500">改动影响 dry-run 和最终提交门槛；真实下单仍需 LIVE_TRADING_ENABLED 与 OKX_LIVE_ORDER_ENABLED 双锁。</p>
       </div>
 
       <div className="mt-5 analysis-card">
@@ -2732,6 +4132,25 @@ export function LiveView({
               )}
             </div>
           </div>
+        </div>
+        <div className="mt-4 overflow-x-auto rounded-[18px] border border-white/10">
+          <table className="trade-table">
+            <thead><tr><th>OKX诊断历史</th><th>分类</th><th>只读</th><th>步骤</th><th>权益</th><th>实盘</th></tr></thead>
+            <tbody>
+              {okxDiagnosticHistory.length ? okxDiagnosticHistory.slice(0, 8).map((row, index) => (
+                <tr key={`${row.time || index}-${row.category || index}`}>
+                  <td>{shortTime(row.time)}</td>
+                  <td>{diagnosticLabel(row.category)}</td>
+                  <td><span className={`candidate-health ${row.readonly_ok ? "is-ok" : "is-risk"}`}>{row.readonly_ok ? "可读" : "不可用"}</span></td>
+                  <td>{row.step_count ?? row.steps?.length ?? 0}</td>
+                  <td>{row.account?.total_equity_usd !== null && row.account?.total_equity_usd !== undefined ? `${money(row.account.total_equity_usd)}U` : "-"}</td>
+                  <td>{row.connector?.can_submit_live ? "异常开启" : row.connector?.dry_run_only ? "dry-run锁定" : "锁定"}</td>
+                </tr>
+              )) : (
+                <tr><td colSpan="6">暂无 OKX 诊断历史。运行诊断后会记录 missing_credentials、权限、签名或只读通过状态。</td></tr>
+              )}
+            </tbody>
+          </table>
         </div>
       </div>
 
@@ -2816,6 +4235,34 @@ export function LiveView({
           </table>
         </div>
         <p className="mt-3 text-xs text-slate-500">{okxOrderPreview?.endpoint || "POST /api/v5/trade/order"} · {okxOrderPreview?.dry_run_only === false ? "可提交" : "仅预览，不提交"}</p>
+        <div className="mt-4 rounded-[18px] border border-white/10 p-4">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <p className="text-xs uppercase tracking-[0.24em] text-slate-500">Canary Payload</p>
+              <h4 className="text-base font-semibold text-white">Canary小额试运行预览</h4>
+              <p className="mt-1 text-sm text-slate-400">
+                目标 {money(canaryOrderPreview.target_notional)}U · 缩放 {canaryOrderPreview.scale_factor ?? "-"} · {canaryOrderPreview.message || "等待执行预演。"}
+              </p>
+            </div>
+            <span className={`snapshot-quality ${canaryOrderPreview.ok ? "is-good" : "is-warn"}`}>{canaryOrderPreview.status || "等待预演"}</span>
+          </div>
+          <div className="mt-3 overflow-x-auto rounded-[14px] border border-white/10">
+            <table className="trade-table">
+              <thead><tr><th>Canary字段</th><th>预览值</th><th>说明</th></tr></thead>
+              <tbody>
+                {Object.keys(canaryOrderPayload).length ? Object.entries(canaryOrderPayload).map(([key, value]) => (
+                  <tr key={`canary-${key}`}>
+                    <td>{key}</td>
+                    <td>{String(value)}</td>
+                    <td>{key === "sz" ? "按 canary 缩放后的合约张数" : key === "clOrdId" ? "canary 幂等ID" : "-"}</td>
+                  </tr>
+                )) : (
+                  <tr><td colSpan="3">{canaryOrderPreview.message || "生成执行预演后显示 canary payload。"}</td></tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
         {!intent ? (
           <p className="mt-4 text-sm text-slate-400">{executionPlan ? "当前没有 ready 信号，因此没有生成订单意图。" : "点击生成执行预演后查看订单意图。"}</p>
         ) : null}
@@ -2913,7 +4360,7 @@ export function LiveView({
           <div>
             <p className="text-xs uppercase tracking-[0.28em] text-slate-500">Execution Ledger</p>
             <h3 className="text-lg font-semibold text-white">执行账本</h3>
-            <p className="mt-1 text-sm text-slate-400">按订单意图哈希记录 dry-run 和提交拒绝，用于识别重复信号和防止重复提交。</p>
+            <p className="mt-1 text-sm text-slate-400">按订单意图哈希记录 dry-run、提交拒绝和订单生命周期，用于识别重复信号、回执缺失、超时和撤单动作。</p>
           </div>
           <button type="button" className="table-action" onClick={() => onRefreshExecutionOrders?.()} disabled={executionOrdersLoading}>
             {executionOrdersLoading ? "刷新中..." : "刷新账本"}
@@ -2921,7 +4368,7 @@ export function LiveView({
         </div>
         <div className="mt-4 overflow-x-auto rounded-[18px] border border-white/10">
           <table className="trade-table">
-            <thead><tr><th>时间</th><th>事件</th><th>状态</th><th>指纹</th><th>品种</th><th>方向</th><th>名义金额</th><th>决策</th><th>操作</th></tr></thead>
+            <thead><tr><th>时间</th><th>事件</th><th>状态</th><th>生命周期</th><th>指纹</th><th>品种</th><th>方向</th><th>名义金额</th><th>决策</th><th>操作</th></tr></thead>
             <tbody>
               {ledgerRows.length ? ledgerRows.map((row, index) => {
                 const key = ledgerRowKey(row, index);
@@ -2930,6 +4377,7 @@ export function LiveView({
                   <td>{auditTimeLabel(row.time)}</td>
                   <td>{ledgerEventLabel(row.event)}</td>
                   <td><span className={`snapshot-quality ${ledgerStatusTone(row)}`}>{row.duplicate_intent ? "重复" : row.status || "-"}</span></td>
+                  <td><span className={`snapshot-quality ${ledgerStatusTone(row)}`}>{row.lifecycle?.label || "-"}</span></td>
                   <td>{row.intent_fingerprint || "-"}</td>
                   <td>{row.inst_id?.replace("-SWAP", "") || "-"}</td>
                   <td>{row.side || "-"}</td>
@@ -2938,7 +4386,7 @@ export function LiveView({
                   <td><button type="button" className="table-action" onClick={() => setSelectedLedgerKey(key)}>详情</button></td>
                 </tr>
               );}) : (
-                <tr><td colSpan="9">{executionOrdersLoading ? "正在读取执行账本..." : "暂无执行账本记录。"}</td></tr>
+                <tr><td colSpan="10">{executionOrdersLoading ? "正在读取执行账本..." : "暂无执行账本记录。"}</td></tr>
               )}
             </tbody>
           </table>
@@ -2970,6 +4418,61 @@ export function LiveView({
                   <strong>{selectedLedgerValidation.ok ? "通过" : selectedLedgerValidation.status || "-"}</strong>
                   <p>{selectedLedgerValidation.message || selectedLedgerOrder.message || "-"}</p>
                 </div>
+                <div>
+                  <span>LIFECYCLE</span>
+                  <strong>{selectedLedgerLifecycle.label || "-"}</strong>
+                  <p>{selectedLedgerLifecycle.next_action || "等待账本生命周期证据。"}</p>
+                </div>
+                <div>
+                  <span>SHADOW ORDER</span>
+                  <strong>{selectedLedgerShadow.would_submit === false ? "未提交" : selectedLedgerShadow.type ? "待确认" : "-"}</strong>
+                  <p>{selectedLedgerShadow.client_order_id || selectedLedgerShadow.blocked_reason || "dry-run 后显示影子实盘证据。"}</p>
+                </div>
+              </div>
+              <div className="mt-4 rounded-[16px] border border-white/10 p-4">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.24em] text-slate-500">Lifecycle Actions</p>
+                    <h4 className="text-base font-semibold text-white">生命周期处置</h4>
+                    <p className="mt-1 text-sm text-slate-400">人工记录默认只写账本；显式 OKX 查询/撤单按钮受连接器和环境锁保护。</p>
+                  </div>
+                  <span className={`snapshot-quality ${ledgerStatusTone(selectedLedgerRow)}`}>{selectedLedgerLifecycle.label || "待记录"}</span>
+                </div>
+                <div className="mt-3 table-actions">
+                  <button type="button" className="table-action" onClick={() => onRecordExecutionAction?.("query", selectedLedgerRow)} disabled={liveSubmitLoading || !selectedLedgerRow}>
+                    {liveSubmitLoading ? "记录中..." : "记录查询回执"}
+                  </button>
+                  <button type="button" className="table-action" onClick={() => onRecordExecutionAction?.("query", selectedLedgerRow, { submit_live_query: true })} disabled={liveSubmitLoading || !canQuerySelectedOrder}>
+                    {liveSubmitLoading ? "查询中..." : "查询OKX状态"}
+                  </button>
+                  <button type="button" className="table-action" onClick={() => onRecordExecutionAction?.("cancel", selectedLedgerRow)} disabled={liveSubmitLoading || !selectedLedgerRow}>
+                    {liveSubmitLoading ? "记录中..." : "记录撤单回执"}
+                  </button>
+                  <button type="button" className="table-action" onClick={() => onRecordExecutionAction?.("cancel", selectedLedgerRow, { submit_live_cancel: true })} disabled={liveSubmitLoading || !canCancelSelectedOrder}>
+                    {liveSubmitLoading ? "撤单中..." : "提交真实撤单"}
+                  </button>
+                  <button type="button" className="table-action" onClick={() => onRecordExecutionAction?.("fill", selectedLedgerRow)} disabled={liveSubmitLoading || !selectedLedgerRow}>
+                    {liveSubmitLoading ? "记录中..." : "记录成交回执"}
+                  </button>
+                </div>
+              </div>
+              <div className="mt-4 overflow-x-auto rounded-[16px] border border-white/10">
+                <table className="trade-table">
+                  <thead><tr><th>订单生命周期证据</th><th>当前值</th><th>门槛</th><th>状态</th><th>动作</th></tr></thead>
+                  <tbody>
+                    {selectedLedgerLifecycleChecks.length ? selectedLedgerLifecycleChecks.map((row) => (
+                      <tr key={row.name}>
+                        <td>{row.name}</td>
+                        <td>{row.value || "-"}</td>
+                        <td>{row.threshold || "-"}</td>
+                        <td><span className={`snapshot-quality ${lifecycleCheckTone(row.status)}`}>{lifecycleStatusLabel(row.status)}</span></td>
+                        <td>{row.action || "-"}</td>
+                      </tr>
+                    )) : (
+                      <tr><td colSpan="5">这条记录没有订单生命周期证据。</td></tr>
+                    )}
+                  </tbody>
+                </table>
               </div>
               <div className="mt-2 grid gap-4 xl:grid-cols-[1fr_1fr]">
                 <div className="overflow-x-auto rounded-[16px] border border-white/10">
@@ -2995,6 +4498,22 @@ export function LiveView({
                       <p>{reason}</p>
                     </div>
                   ))}
+                  <div>
+                    <span>ADAPTER PREVIEW</span>
+                    <p>{selectedLedgerAdapterPreview.endpoint || "记录查询/撤单回执后显示安全请求预览。"}</p>
+                  </div>
+                  <div>
+                    <span>SHADOW LOCK</span>
+                    <p>{selectedLedgerShadow.type ? `${selectedLedgerShadowConnector.dry_run_only ? "dry_run_only" : "需复核"} · can_submit_live=${selectedLedgerShadowConnector.can_submit_live ? "true" : "false"}` : "等待影子订单证据。"}</p>
+                  </div>
+                  <div>
+                    <span>PAYLOAD HASH</span>
+                    <p>{selectedLedgerShadow.payload_sha256 ? `${selectedLedgerShadow.payload_sha256.slice(0, 16)}...` : "无 payload hash"}</p>
+                  </div>
+                  <div>
+                    <span>MISSING</span>
+                    <p>{selectedLedgerAdapterPreview.missing_fields?.join(" / ") || "无缺失字段"}</p>
+                  </div>
                 </div>
               </div>
               <div className="mt-4 grid gap-4 xl:grid-cols-[1fr_1fr]">
@@ -3014,15 +4533,60 @@ export function LiveView({
                   <span>Payload / Gate JSON</span>
                   <pre>{JSON.stringify({
                     intent: selectedLedgerRow.order_intent,
+                    lifecycle: selectedLedgerLifecycle,
+                    adapter_preview: selectedLedgerAdapterPreview,
                     exchange_validation: selectedLedgerValidation,
                     okx_order: selectedLedgerOrder,
+                    canary_order: selectedLedgerRow.canary_order,
+                    shadow_order: selectedLedgerShadow,
                     final_gate: selectedLedgerFinalGate,
                   }, null, 2)}</pre>
                 </div>
               </div>
             </>
           ) : (
-            <div className="task-detail-empty">当前没有执行账本记录。</div>
+            <>
+              <div className="task-detail-empty">当前没有执行账本记录。</div>
+              <div className="mt-4 rounded-[16px] border border-white/10 p-4">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.24em] text-slate-500">Lifecycle Actions</p>
+                    <h4 className="text-base font-semibold text-white">生命周期处置</h4>
+                    <p className="mt-1 text-sm text-slate-400">执行账本生成后可记录查询、撤单或成交回执。</p>
+                  </div>
+                  <span className="snapshot-quality is-info">待记录</span>
+                </div>
+                <div className="mt-3 table-actions">
+                  <button type="button" className="table-action" disabled>记录查询回执</button>
+                  <button type="button" className="table-action" disabled>查询OKX状态</button>
+                  <button type="button" className="table-action" disabled>记录撤单回执</button>
+                  <button type="button" className="table-action" disabled>提交真实撤单</button>
+                  <button type="button" className="table-action" disabled>记录成交回执</button>
+                </div>
+              </div>
+              <div className="mt-4 overflow-x-auto rounded-[16px] border border-white/10">
+                <table className="trade-table">
+                  <thead><tr><th>订单生命周期证据</th><th>当前值</th><th>门槛</th><th>状态</th><th>动作</th></tr></thead>
+                  <tbody>
+                    <tr><td colSpan="5">暂无执行账本记录，运行执行预演或提交锁测试后显示生命周期证据。</td></tr>
+                  </tbody>
+                </table>
+              </div>
+              <div className="task-detail-meta">
+                <div>
+                  <span>ADAPTER PREVIEW</span>
+                  <p>记录查询/撤单回执后显示安全请求预览。</p>
+                </div>
+                <div>
+                  <span>MISSING</span>
+                  <p>等待账本记录。</p>
+                </div>
+              </div>
+              <div className="ledger-json-panel">
+                <span>Payload / Gate JSON</span>
+                <pre>{JSON.stringify({ selected: null }, null, 2)}</pre>
+              </div>
+            </>
           )}
         </div>
       </div>
@@ -3102,7 +4666,10 @@ export function SettingsView({
   const staleRows = cacheRows.filter((row) => row.is_stale);
   const systemCache = systemStatus?.cache || {};
   const systemTasks = systemStatus?.tasks || {};
+  const systemExecution = systemStatus?.execution || {};
   const systemFiles = systemStatus?.files || {};
+  const systemBacktest = systemStatus?.recent_backtest || {};
+  const systemConnectorHealth = systemStatus?.environment?.connector_health || {};
   const systemRecommendations = systemStatus?.recommendations || [];
   const taskCountsText = Object.entries(systemTasks.counts || {}).map(([key, value]) => `${key} ${value}`).join(" · ") || "无任务";
   const fileRows = [
@@ -3110,6 +4677,7 @@ export function SettingsView({
     ["paper_events", "模拟事件"],
     ["paper_audit", "审计记录"],
     ["execution_orders", "执行账本"],
+    ["automation_state", "自动化状态"],
     ["signal_log", "信号日志"],
     ["task_history", "任务历史"],
   ].map(([key, label]) => ({ key, label, ...(systemFiles[key] || {}) }));
@@ -3155,11 +4723,39 @@ export function SettingsView({
       action: liveSwitch ? "确认确实需要真实下单，否则关闭总锁。" : "真实下单仍被总锁保护。",
     },
     {
+      name: "最近回测",
+      value: systemBacktest.return_pct !== undefined && systemBacktest.return_pct !== null ? pct(systemBacktest.return_pct) : "-",
+      status: systemBacktest.ok ? "新鲜" : systemBacktest.status === "missing" ? "缺失" : "需更新",
+      tone: systemBacktest.ok ? "is-good" : "is-warn",
+      action: systemBacktest.ok ? `健康 ${systemBacktest.health_grade || "-"} · ${Math.round(Number(systemBacktest.age_seconds || 0) / 60)} 分钟前` : "运行 recent-backtest --write 更新实盘前回测证据。",
+    },
+    {
+      name: "执行生命周期",
+      value: `${systemExecution.blocked_count ?? 0} 阻断 / ${systemExecution.tracking_count ?? 0} 跟踪`,
+      status: Number(systemExecution.blocked_count || 0) ? "需处理" : Number(systemExecution.tracking_count || 0) ? "跟踪中" : "正常",
+      tone: Number(systemExecution.blocked_count || 0) ? "is-bad" : Number(systemExecution.tracking_count || 0) ? "is-info" : "is-good",
+      action: systemExecution.latest_action || "执行账本没有回执超时或待撤单记录。",
+    },
+    {
       name: "OKX只读",
       value: readonlyReady ? "已连接" : "未连接",
       status: readonlyReady ? "通过" : "待处理",
       tone: readonlyReady ? "is-good" : "is-warn",
       action: readonlyReady ? "可用于实盘门槛复核。" : "去实盘页运行 OKX 诊断或输入密钥。",
+    },
+    {
+      name: "连接器健康",
+      value: systemConnectorHealth.status || "未检查",
+      status: systemConnectorHealth.signature_ready ? "签名就绪" : "待处理",
+      tone: systemConnectorHealth.signature_ready ? "is-good" : systemConnectorHealth.configured ? "is-info" : "is-warn",
+      action: systemConnectorHealth.next_action || "进入实盘页运行 OKX 诊断。",
+    },
+    {
+      name: "私有接口锁",
+      value: systemConnectorHealth.dry_run_only ? "dry-run" : "未知",
+      status: systemConnectorHealth.can_submit_live ? "可提交" : "锁定",
+      tone: systemConnectorHealth.can_submit_live ? "is-bad" : "is-good",
+      action: systemConnectorHealth.blocked_reason || "真实提交仍需人工评审和总锁。",
     },
     {
       name: "维护建议",
@@ -3171,6 +4767,8 @@ export function SettingsView({
   ];
   const minLiveEquity = Number(liveRiskConfig?.min_live_equity_usd ?? 10);
   const marginBufferMult = Number(liveRiskConfig?.live_margin_buffer_mult ?? 1.2);
+  const maxLiveOrderNotional = Number(liveRiskConfig?.max_live_order_notional_usd ?? 10);
+  const canaryOrderNotional = Number(liveRiskConfig?.canary_order_notional_usd ?? 10);
   const updateLiveNumber = (key, value) => {
     const number = Number(value);
     if (Number.isFinite(number)) onLiveRiskConfigChange?.({ [key]: number });
@@ -3200,6 +4798,7 @@ export function SettingsView({
           <StatCell label="后端服务" value={systemStatus?.ok ? "正常" : "待同步"} note={`启动 ${shortTime(systemStatus?.server?.started_at)}`} tone={systemStatus?.ok ? "text-aqua" : "text-risk"} />
           <StatCell label="缓存目录" value={bytesLabel(systemCache.size_bytes)} note={`${systemCache.file_count ?? 0} 个文件 · 陈旧 ${systemCache.stale_rows ?? staleRows.length}`} />
           <StatCell label="后台任务" value={`${systemTasks.total ?? 0} 个`} note={`活跃 ${systemTasks.active_count ?? 0} · 队列 ${systemTasks.queue_depth ?? 0}`} tone={(systemTasks.active_count ?? 0) > 0 ? "text-aqua" : ""} />
+          <StatCell label="最近回测" value={systemBacktest.return_pct !== undefined && systemBacktest.return_pct !== null ? pct(systemBacktest.return_pct) : "-"} note={`健康 ${systemBacktest.health_grade || "-"} · ${Math.round(Number(systemBacktest.age_seconds || 0) / 60)} 分钟前`} tone={systemBacktest.ok ? "text-aqua" : "text-risk"} />
           <StatCell label="OKX环境" value={systemStatus?.environment?.okx_configured ? "已配置" : "未配置"} note={systemStatus?.environment?.live_trading_enabled ? "实盘总开关开启" : "实盘总开关关闭"} tone={systemStatus?.environment?.live_trading_enabled ? "text-risk" : "text-aqua"} />
         </div>
         <div className="mt-4 overflow-x-auto rounded-[18px] border border-white/10">
@@ -3272,6 +4871,8 @@ export function SettingsView({
             server: systemStatus?.server || {},
             cache: systemCache,
             tasks: systemTasks,
+            recent_backtest: systemBacktest,
+            execution: systemExecution,
             files: systemFiles,
             evidence: systemEvidenceRows.map((row) => ({
               name: row.name,
@@ -3346,8 +4947,28 @@ export function SettingsView({
               />
               <em>保证金缓冲倍数</em>
             </label>
+            <label className="param-input live-risk-input">
+              <input
+                min="0"
+                step="0.1"
+                type="number"
+                value={Number.isFinite(maxLiveOrderNotional) ? maxLiveOrderNotional : 10}
+                onChange={(event) => updateLiveNumber("max_live_order_notional_usd", event.target.value)}
+              />
+              <em>单笔名义上限 USDT</em>
+            </label>
+            <label className="param-input live-risk-input">
+              <input
+                min="0"
+                step="0.1"
+                type="number"
+                value={Number.isFinite(canaryOrderNotional) ? canaryOrderNotional : 10}
+                onChange={(event) => updateLiveNumber("canary_order_notional_usd", event.target.value)}
+              />
+              <em>Canary试运行 USDT</em>
+            </label>
           </div>
-          <p className="mt-2 text-xs text-slate-500">这些参数只影响 dry-run 和最终提交门槛，不会开启真实下单。</p>
+          <p className="mt-2 text-xs text-slate-500">这些参数影响 dry-run 和最终提交门槛；真实下单仍需双环境锁、确认短语和最终门槛全部通过。</p>
         </div>
       </div>
 
